@@ -414,12 +414,7 @@ class PolicyRunner(Node):
             # Add processed data to message
             processed_outputs_msg.data = processed_data
             # Publish the processed outputs to the /policy_outputs topic
-            if not self.dry_run:
-                self.processed_outputs_publisher.publish(processed_outputs_msg)
-            else:
-                if self.print_counter % self.print_frequency == 0: # Log less frequently in dry run
-                    self.get_logger().info(f"DRY RUN: Would publish policy outputs: {processed_data}")
-
+            self.processed_outputs_publisher.publish(processed_outputs_msg)
 
         except Exception as e:
             self.get_logger().error(f"Error publishing processed outputs: {e}")
@@ -427,53 +422,10 @@ class PolicyRunner(Node):
         # --- End Joint Position Control ---
 
         # --- Gripper Command Execution ---
-        allow_close = True # Flag to control if closing is allowed
-
-        # Only allow gripper close commands if the end-effector is close to the object
-        # and the object is not already grasped
-        if not self.object_grasped:
-            distance_to_object = np.linalg.norm(self.ee_pos - self.object_position)
-            proximity_threshold = 0.05 # 5cm threshold
-            if distance_to_object >= proximity_threshold:
-                allow_close = False
-                if self.print_counter % self.print_frequency == 0: # Log less frequently
-                    self.get_logger().debug(f"EE distance to object ({distance_to_object:.3f}m) >= threshold ({proximity_threshold}m). Forcing gripper open.")
-
-        # Determine desired state based on command, proximity, and hysteresis
-        desired_gripper_state = self.gripper_goal_state # Default to current state
-
-        # Apply hysteresis thresholds
-        close_threshold = -0.1
-        open_threshold = 0.1
-
-        if self.gripper_goal_state == 'open' and gripper_command <= close_threshold:
-            if allow_close:
-                desired_gripper_state = 'closed'
-                if self.print_counter % self.print_frequency == 0:
-                    self.get_logger().debug(f"Gripper command ({gripper_command:.2f}) <= close threshold ({close_threshold}) and proximity ok. Requesting CLOSE.")
-            else:
-                # If close is not allowed due to distance, keep it open
-                desired_gripper_state = 'open'
-                if self.print_counter % self.print_frequency == 0:
-                    self.get_logger().debug(f"Gripper command ({gripper_command:.2f}) <= close threshold ({close_threshold}) but proximity check failed. Keeping OPEN.")
-
-        elif self.gripper_goal_state == 'closed' and gripper_command >= open_threshold:
-            desired_gripper_state = 'open'
-            if self.print_counter % self.print_frequency == 0:
-                 self.get_logger().debug(f"Gripper command ({gripper_command:.2f}) >= open threshold ({open_threshold}). Requesting OPEN.")
-        # else: keep desired_gripper_state = self.gripper_goal_state (no change)
-
+        desired_gripper_state = 'closed' if gripper_command <= 0 else 'open'
 
         # Only send a command if the desired state is different from the current goal state
         if desired_gripper_state != self.gripper_goal_state:
-            if self.dry_run:
-                 self.get_logger().info(f"DRY RUN: Would change gripper state from {self.gripper_goal_state} to {desired_gripper_state}")
-                 self.gripper_goal_state = desired_gripper_state # Update state even in dry run
-                 if desired_gripper_state == 'open':
-                     self.object_grasped = False # Assume opening drops object
-                 # Note: In dry run, grasp success isn't simulated, so object_grasped won't be set true on close.
-                 return # Don't proceed to action clients in dry run
-
             if desired_gripper_state == 'open':
                 if self.move_client.server_is_ready():
                     self.get_logger().info(f"Sending Move goal (open) - Width: {self.gripper_max_width}, Speed: {self.gripper_speed}")
@@ -481,7 +433,7 @@ class PolicyRunner(Node):
                     goal_msg = Move.Goal()
                     goal_msg.width = self.gripper_max_width
                     goal_msg.speed = self.gripper_speed
-                    self.move_client.send_goal_async(goal_msg) # Fire and forget for opening
+                    self.move_client.send_goal_async(goal_msg)
                     self.gripper_goal_state = 'open'
                     self.object_grasped = False # Reset flag when opening gripper
                     self.get_logger().info("Object grasp flag set to False (gripper opening).")
@@ -489,14 +441,6 @@ class PolicyRunner(Node):
                     self.get_logger().warning("Move action server not ready. Cannot open gripper.")
 
             elif desired_gripper_state == 'closed':
-                # Double check proximity just before sending close command (optional, but safer)
-                if not self.object_grasped:
-                    distance_to_object = np.linalg.norm(self.ee_pos - self.object_position)
-                    if distance_to_object >= proximity_threshold:
-                         self.get_logger().warning(f"Proximity check failed just before sending grasp command ({distance_to_object:.3f}m >= {proximity_threshold}m). Aborting close.")
-                         # We don't change gripper_goal_state here, it remains 'open'
-                         return # Abort sending the close command
-
                 if self.grasp_client.server_is_ready():
                     self.get_logger().info(f"Sending Grasp goal (close) - Width: 0.0, Speed: {self.gripper_speed}, Force: {self.gripper_force}")
                     self.get_logger().info("Pausing policy execution until grasp completes.")
@@ -513,7 +457,7 @@ class PolicyRunner(Node):
                     grasp_future = self.grasp_client.send_goal_async(goal_msg)
                     grasp_future.add_done_callback(self.grasp_goal_response_callback) # Check if goal was accepted
 
-                    self.gripper_goal_state = 'closed' # Set goal state optimistically
+                    self.gripper_goal_state = 'closed'
                 else:
                     self.get_logger().warning("Grasp action server not ready. Cannot close gripper.")
         # --- End Gripper Command Execution ---

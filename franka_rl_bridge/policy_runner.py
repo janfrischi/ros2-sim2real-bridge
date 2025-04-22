@@ -552,6 +552,12 @@ class PolicyRunner(Node):
         self.get_logger().info("Internal state (last_action, object_pos, grasped_flag) reset complete.")
         # --- End Reset Internal State ---
 
+        # --- Set joint positions/velocities to home for immediate policy step ---
+        # Home positions for arm (7) + gripper (2)
+        home_position_full = np.array([0.0, -0.569, 0.0, -2.810, 0.0, 3.037, 0.741, 0.04, 0.04])
+        home_velocity_full = np.zeros(9)
+        self.joint_positions = home_position_full
+        self.joint_velocities = home_velocity_full
 
         # Send robot to home position
         self.get_logger().info("Resetting robot to home position and opening gripper")

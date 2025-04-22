@@ -529,7 +529,7 @@ class PolicyRunner(Node):
     def reset_to_home(self):
         """Reset the robot to home position and open gripper."""
         # Define home position joint angles
-        home_position = [0.0, -0.25529, 0.0, -1.9518, 0.0, 1.7184, 0.7458]
+        home_position = [0.0, -0.569, 0.0, -2.810, 0.0, 3.037, 0.741]
         
         # Stop policy execution temporarily
         self.stop()  # Ensure the robot is paused

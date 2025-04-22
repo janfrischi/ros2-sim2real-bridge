@@ -414,7 +414,12 @@ class PolicyRunner(Node):
             # Add processed data to message
             processed_outputs_msg.data = processed_data
             # Publish the processed outputs to the /policy_outputs topic
-            self.processed_outputs_publisher.publish(processed_outputs_msg)
+            if not self.dry_run:
+                self.processed_outputs_publisher.publish(processed_outputs_msg)
+            else:
+                if self.print_counter % self.print_frequency == 0: # Log less frequently in dry run
+                    self.get_logger().info(f"DRY RUN: Would publish policy outputs: {processed_data}")
+
 
         except Exception as e:
             self.get_logger().error(f"Error publishing processed outputs: {e}")
@@ -422,10 +427,53 @@ class PolicyRunner(Node):
         # --- End Joint Position Control ---
 
         # --- Gripper Command Execution ---
-        desired_gripper_state = 'closed' if gripper_command <= 0 else 'open'
+        allow_close = True # Flag to control if closing is allowed
+
+        # Only allow gripper close commands if the end-effector is close to the object
+        # and the object is not already grasped
+        if not self.object_grasped:
+            distance_to_object = np.linalg.norm(self.ee_pos - self.object_position)
+            proximity_threshold = 0.05 # 5cm threshold
+            if distance_to_object >= proximity_threshold:
+                allow_close = False
+                if self.print_counter % self.print_frequency == 0: # Log less frequently
+                    self.get_logger().debug(f"EE distance to object ({distance_to_object:.3f}m) >= threshold ({proximity_threshold}m). Forcing gripper open.")
+
+        # Determine desired state based on command, proximity, and hysteresis
+        desired_gripper_state = self.gripper_goal_state # Default to current state
+
+        # Apply hysteresis thresholds
+        close_threshold = -0.1
+        open_threshold = 0.1
+
+        if self.gripper_goal_state == 'open' and gripper_command <= close_threshold:
+            if allow_close:
+                desired_gripper_state = 'closed'
+                if self.print_counter % self.print_frequency == 0:
+                    self.get_logger().debug(f"Gripper command ({gripper_command:.2f}) <= close threshold ({close_threshold}) and proximity ok. Requesting CLOSE.")
+            else:
+                # If close is not allowed due to distance, keep it open
+                desired_gripper_state = 'open'
+                if self.print_counter % self.print_frequency == 0:
+                    self.get_logger().debug(f"Gripper command ({gripper_command:.2f}) <= close threshold ({close_threshold}) but proximity check failed. Keeping OPEN.")
+
+        elif self.gripper_goal_state == 'closed' and gripper_command >= open_threshold:
+            desired_gripper_state = 'open'
+            if self.print_counter % self.print_frequency == 0:
+                 self.get_logger().debug(f"Gripper command ({gripper_command:.2f}) >= open threshold ({open_threshold}). Requesting OPEN.")
+        # else: keep desired_gripper_state = self.gripper_goal_state (no change)
+
 
         # Only send a command if the desired state is different from the current goal state
         if desired_gripper_state != self.gripper_goal_state:
+            if self.dry_run:
+                 self.get_logger().info(f"DRY RUN: Would change gripper state from {self.gripper_goal_state} to {desired_gripper_state}")
+                 self.gripper_goal_state = desired_gripper_state # Update state even in dry run
+                 if desired_gripper_state == 'open':
+                     self.object_grasped = False # Assume opening drops object
+                 # Note: In dry run, grasp success isn't simulated, so object_grasped won't be set true on close.
+                 return # Don't proceed to action clients in dry run
+
             if desired_gripper_state == 'open':
                 if self.move_client.server_is_ready():
                     self.get_logger().info(f"Sending Move goal (open) - Width: {self.gripper_max_width}, Speed: {self.gripper_speed}")
@@ -433,7 +481,7 @@ class PolicyRunner(Node):
                     goal_msg = Move.Goal()
                     goal_msg.width = self.gripper_max_width
                     goal_msg.speed = self.gripper_speed
-                    self.move_client.send_goal_async(goal_msg)
+                    self.move_client.send_goal_async(goal_msg) # Fire and forget for opening
                     self.gripper_goal_state = 'open'
                     self.object_grasped = False # Reset flag when opening gripper
                     self.get_logger().info("Object grasp flag set to False (gripper opening).")
@@ -441,6 +489,14 @@ class PolicyRunner(Node):
                     self.get_logger().warning("Move action server not ready. Cannot open gripper.")
 
             elif desired_gripper_state == 'closed':
+                # Double check proximity just before sending close command (optional, but safer)
+                if not self.object_grasped:
+                    distance_to_object = np.linalg.norm(self.ee_pos - self.object_position)
+                    if distance_to_object >= proximity_threshold:
+                         self.get_logger().warning(f"Proximity check failed just before sending grasp command ({distance_to_object:.3f}m >= {proximity_threshold}m). Aborting close.")
+                         # We don't change gripper_goal_state here, it remains 'open'
+                         return # Abort sending the close command
+
                 if self.grasp_client.server_is_ready():
                     self.get_logger().info(f"Sending Grasp goal (close) - Width: 0.0, Speed: {self.gripper_speed}, Force: {self.gripper_force}")
                     self.get_logger().info("Pausing policy execution until grasp completes.")
@@ -457,7 +513,7 @@ class PolicyRunner(Node):
                     grasp_future = self.grasp_client.send_goal_async(goal_msg)
                     grasp_future.add_done_callback(self.grasp_goal_response_callback) # Check if goal was accepted
 
-                    self.gripper_goal_state = 'closed'
+                    self.gripper_goal_state = 'closed' # Set goal state optimistically
                 else:
                     self.get_logger().warning("Grasp action server not ready. Cannot close gripper.")
         # --- End Gripper Command Execution ---
@@ -527,45 +583,70 @@ class PolicyRunner(Node):
         self.get_logger().info("Policy execution stopped")
 
     def reset_to_home(self):
-        """Reset the robot to home position and open gripper."""
-        # Define home position joint angles
-        home_position = [0.0, -0.569, 0.0, -2.810, 0.0, 3.037, 0.741]
-        
+        """Reset the robot to home position, open gripper, and reset internal state."""
+        # Define home position joint angles (arm only)
+        home_position_arm = [0.0, -0.569, 0.0, -2.810, 0.0, 3.037, 0.741]
+
         # Stop policy execution temporarily
         self.stop()  # Ensure the robot is paused
-        self.object_grasped = False # Ensure object is considered not grasped on reset
+
+        # --- Reset Internal State ---
+        self.get_logger().info("Resetting internal state variables...")
+        # Reset last action - Crucial for policy's initial step after restart
+        self.last_action = torch.zeros((1, self.policy_loader.action_dim), device=self.policy_loader.device)
+        # Reset object position to its initial configured value
+        self.object_position = np.array([0.5, 0.3, 0.055]) # Reset to initial position
+        # Reset object grasped flag
+        self.object_grasped = False
+        # Reset gripper goal state (will be set to 'open' by the move command)
+        self.gripper_goal_state = 'unknown'
+        # Reset print counter if desired
+        self.print_counter = 0
+        # NOTE: We are NOT resetting self.joint_positions and self.joint_velocities here.
+        # The observation_callback will update them based on the actual robot state
+        # as it moves to the home position.
+        self.get_logger().info("Internal state (last_action, object_pos, grasped_flag) reset complete.")
+        # --- End Reset Internal State ---
+
 
         # Send robot to home position
         self.get_logger().info("Resetting robot to home position and opening gripper")
-        
+
         # Publish directly to policy outputs to reset joints
         processed_outputs_msg = Float64MultiArray()
-        processed_data = [float(pos) for pos in home_position]
-        processed_data.append(-1.0)  # Append a negative value for gripper command to indicate open
+        # Use the actual home joint positions for the command
+        processed_data = [float(pos) for pos in home_position_arm]
+        # Append a positive value for gripper command to indicate open
+        processed_data.append(float(-1.0)) # Positive value indicates open for policy output interpretation
         processed_outputs_msg.data = processed_data
 
         if not self.dry_run:
+            # Publish the home position command
             self.processed_outputs_publisher.publish(processed_outputs_msg)
+            self.get_logger().info(f"Published home position command: {processed_data}")
 
             # Send command to open gripper via action client
             if self.move_client.server_is_ready():
+                self.get_logger().info(f"Sending Move goal (open) - Width: {self.gripper_max_width}, Speed: {self.gripper_speed}")
                 goal_msg = Move.Goal()
                 goal_msg.width = self.gripper_max_width
                 goal_msg.speed = self.gripper_speed
-                self.move_client.send_goal_async(goal_msg)
+                # Send goal and wait briefly for it to be accepted/processed
+                move_future = self.move_client.send_goal_async(goal_msg)
+                # Optional: Add a callback or wait slightly if needed, but for reset, async might be fine
                 self.gripper_goal_state = 'open' # Update state
             else:
                  self.get_logger().warning("Move action server not ready during reset. Cannot open gripper.")
         else:
-            self.get_logger().info(f"DRY RUN: Would publish home joints: {home_position}")
+            self.get_logger().info(f"DRY RUN: Would publish home joints command: {processed_data}")
             self.get_logger().info("DRY RUN: Would send Move goal to open gripper.")
             self.gripper_goal_state = 'open' # Update state even in dry run
 
-        # Wait a bit for movement to potentially start
-        time.sleep(1.0)
-        
+        # Wait a bit for movement command to be processed and potentially start
+        time.sleep(0.5) # Reduced sleep time
+
         # Log that the robot is now in pause mode
-        self.get_logger().info("Robot reset command sent. Policy execution is paused.")
+        self.get_logger().info("Robot reset command sent. Policy execution is paused. Press 's' to start.")
 
     def destroy_node(self):
         """Clean up resources when the node is destroyed"""

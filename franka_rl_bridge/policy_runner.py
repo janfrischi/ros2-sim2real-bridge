@@ -529,11 +529,17 @@ class PolicyRunner(Node):
     def reset_to_home(self):
         """Reset the robot to home position and open gripper."""
         # Define home position joint angles
-        home_position = [0.0, -0.25529, 0.0, -1.9518, 0.0, 1.7184, 0.7458]
+        home_position = [0.0, -0.569, 0.0, -2.810, 0.0, 3.037, 0.741]
         
         # Stop policy execution temporarily
         self.stop()  # Ensure the robot is paused
         self.object_grasped = False # Ensure object is considered not grasped on reset
+        # Reset the last action
+        self.last_action = torch.zeros((1, self.policy_loader.action_dim), device=self.policy_loader.device)
+        # Reset the object position 
+        self.object_position = np.array([0.5, 0.3, 0.055])  # Reset to initial position
+        # Reset the gripper state
+        self.gripper_goal_state = 'unknown'  # Reset gripper state
 
         # Send robot to home position
         self.get_logger().info("Resetting robot to home position and opening gripper")

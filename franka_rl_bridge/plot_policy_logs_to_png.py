@@ -75,7 +75,7 @@ def create_and_save_plot(df, variable_name, title, filename):
             opacity=0.95
         ))
     # Limit x-axis to [0, min(4, max timestamp)]
-    x_max = min(4, df["timestamp"].max())
+    x_max = min(30, df["timestamp"].max())
     fig.update_layout(
         title=dict(text=title, font=dict(size=20, family="Arial"), x=0.5),  # Larger, centered title
         xaxis_title="Time (seconds)",

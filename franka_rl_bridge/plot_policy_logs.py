@@ -44,13 +44,15 @@ def create_plot(df, variable_name, title):
             mode="lines",
             name=f"{variable_name}[{i}]"
         ))
+    # Limit x-axis to [0, min(4, max timestamp)]
+    x_max = min(4, df["timestamp"].max())
     fig.update_layout(
-        title=title,
+        title=dict(text=title, x=0.5),  # Center the title
         xaxis_title="Time (seconds)",
         yaxis_title="Values",
         legend_title="Variables",
         template="plotly_white",
-        xaxis=dict(range=[0, 4])  # Set x-axis range from 0 to 4 seconds
+        xaxis=dict(range=[0, x_max])
     )
     fig.show()
 

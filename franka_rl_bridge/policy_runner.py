@@ -23,6 +23,7 @@ import torch
 from rclpy.action import ActionClient
 from franka_msgs.action import Homing, Move, Grasp
 from action_msgs.msg import GoalStatus
+from rclpy.duration import Duration
 
 
 # Import the PolicyLoader class from policy_inference
@@ -92,6 +93,10 @@ class PolicyRunner(Node):
         
         # Store last action
         self.last_action = torch.zeros((1, self.policy_loader.action_dim), device=self.policy_loader.device)
+
+        # Intorduce hold postition flag and timer
+        self.hold_position_active = False
+        self.hold_position_end_time = None
         
         # Callback group for allowing concurrent callbacks
         self.callback_group = ReentrantCallbackGroup()
@@ -125,10 +130,10 @@ class PolicyRunner(Node):
         # --- Gripper Control Initialization ---
         self.gripper_goal_state = 'unknown' # 'open', 'closed', 'unknown'
         self.gripper_max_width = 0.08 # Max width for Franka Hand
-        self.gripper_speed = 0.2 # Default speed
+        self.gripper_speed = 0.05 # Default speed
         self.gripper_force = 30.0 # Default grasp force (N)
-        self.gripper_epsilon_inner = 0.005
-        self.gripper_epsilon_outer = 0.005
+        self.gripper_epsilon_inner = 0.01
+        self.gripper_epsilon_outer = 0.01
 
         # Action clients for gripper
         self.homing_client = ActionClient(self, Homing, '/fr3_gripper/homing', callback_group=self.callback_group)
@@ -153,13 +158,18 @@ class PolicyRunner(Node):
         
         # Initialize print counter
         self.print_counter = 0
-        self.print_frequency = 20  # Print every 10 iterations
+        self.print_frequency = 1000  # Print every 10 iterations
         
         self.get_logger().info('Policy Runner initialized')
 
         # Start 100Hz policy execution timer
         self.policy_timer = self.create_timer(0.01, self.timer_policy_step, callback_group=self.callback_group)
         self.get_logger().info("Policy execution timer started at 100Hz")
+
+        # Timer for continously publishing hold positions at 100Hz
+        self.hold_position_timer = self.create_timer(0.01, self.hold_position_step, callback_group=self.callback_group)
+
+
 
     # Helper to wait for action servers
     def wait_for_action_server(self, client, name):
@@ -235,16 +245,7 @@ class PolicyRunner(Node):
         
     def timer_policy_step(self):
         """Run policy inference and send actions at fixed 100Hz loop."""
-        if not hasattr(self, 'timer_counter'):
-            self.timer_counter = 0  # Initialize a counter to track timer calls
-
-        self.timer_counter += 1
-
-        # Print a message every 100 iterations (approximately once per second at 100Hz)
-        if self.timer_counter % 100 == 0:
-            self.get_logger().info(f"Timer triggered {self.timer_counter} times (running at ~100Hz)")
-
-        # If the policy is running, execute the inference
+        # Run the policy inference if active
         if self.running:
             self.run_policy_inference()
 
@@ -268,20 +269,42 @@ class PolicyRunner(Node):
         
         # Increment print counter
         self.print_counter += 1
+
+        # --- SAFETY: Prevent end-effector from going below table + margin ---
+        min_ee_z = 0.03
+        current_ee_z = self.ee_pos[2] if self.ee_pos is not None and len(self.ee_pos) > 2 else None
+        if current_ee_z is not None and current_ee_z < min_ee_z:
+            self.get_logger().warning(
+                f"Safety: End-effector z={current_ee_z:.3f} below safety threshold ({min_ee_z:.3f}). "
+                "Sending safe joint positions to avoid table collision."
+            )
+            # Send current joint positions (relative, so add default) as a safe fallback
+            default_joints = np.array([0.0, -0.569, 0.0, -2.810, 0.0, 3.037, 0.741])
+            safe_joint_positions = (self.joint_positions[:7] + default_joints).tolist()
+            # Use last gripper command or open gripper
+            safe_gripper_command = float(self.last_action[0, -1].item()) if self.last_action is not None else 1.0
+            safe_action_dict = {
+                "joint_positions": safe_joint_positions,
+                "gripper_command": safe_gripper_command
+            }
+            self.execute_action(safe_action_dict)
+            # Optionally, pause policy execution after sending safe command
+            # self.stop()
+            return
         
-        # Log detailed information about the observation every `print_frequency` iterations
-        if self.print_counter % self.print_frequency == 0:
-            self.get_logger().info("==== Policy Observation Details ====")
-            self.get_logger().info(f"Joint positions (9):  [{', '.join([f'{x:.3f}' for x in self.joint_positions])}]")
-            self.get_logger().info(f"Joint velocities (9): [{', '.join([f'{x:.3f}' for x in self.joint_velocities])}]")
-            self.get_logger().info(f"Object position (3):  [{', '.join([f'{x:.3f}' for x in self.object_position])}]")
-            self.get_logger().info(f"Target position (7):  [{', '.join([f'{x:.3f}' for x in self.target_position])}]")
+        # # Log detailed information about the observation every `print_frequency` iterations
+        # if self.print_counter % self.print_frequency == 0:
+        #     self.get_logger().info("==== Policy Observation Details ====")
+        #     self.get_logger().info(f"Joint positions (9):  [{', '.join([f'{x:.3f}' for x in self.joint_positions])}]")
+        #     self.get_logger().info(f"Joint velocities (9): [{', '.join([f'{x:.3f}' for x in self.joint_velocities])}]")
+        #     self.get_logger().info(f"Object position (3):  [{', '.join([f'{x:.3f}' for x in self.object_position])}]")
+        #     self.get_logger().info(f"Target position (7):  [{', '.join([f'{x:.3f}' for x in self.target_position])}]")
             
-            # Try to get the last action if it exists
-            if self.last_action is not None:
-                last_action_np = self.last_action.detach().cpu().numpy()[0]
-                self.get_logger().info(f"Last action (8):      [{', '.join([f'{x:.3f}' for x in last_action_np])}]")
-            self.get_logger().info("==================================")
+        #     # Try to get the last action if it exists
+        #     if self.last_action is not None:
+        #         last_action_np = self.last_action.detach().cpu().numpy()[0]
+        #         self.get_logger().info(f"Last action (8):      [{', '.join([f'{x:.3f}' for x in last_action_np])}]")
+        #     self.get_logger().info("==================================")
         
         # Run inference at the same frequency as training frequency in simulation
         try:
@@ -346,23 +369,63 @@ class PolicyRunner(Node):
             for scaled_action, q_default in zip(scaled_actions, default_joints.values())
         ]
         
-        # Debug logging
-        if self.print_counter % self.print_frequency == 0:
-            self.get_logger().info("==== Policy Action Processing ====")
-            self.get_logger().info(f"Observations (q_robot - q_default): [{', '.join([f'{x:.3f}' for x in self.joint_positions])}]")
-            self.get_logger().info(f"Raw policy outputs:  [{', '.join([f'{x:.3f}' for x in arm_actions])}]")
-            self.get_logger().info(f"Scaled policy outputs (x{scaling_factor}): [{', '.join([f'{x:.3f}' for x in scaled_actions])}]")
-            self.get_logger().info(f"Target joint positions (q_target): [{', '.join([f'{x:.3f}' for x in joint_positions])}]")
-            self.get_logger().info("================================")
+        # # Debug logging
+        # if self.print_counter % self.print_frequency == 0:
+        #     self.get_logger().info("==== Policy Action Processing ====")
+        #     self.get_logger().info(f"Observations (q_robot - q_default): [{', '.join([f'{x:.3f}' for x in self.joint_positions])}]")
+        #     self.get_logger().info(f"Raw policy outputs:  [{', '.join([f'{x:.3f}' for x in arm_actions])}]")
+        #     self.get_logger().info(f"Scaled policy outputs (x{scaling_factor}): [{', '.join([f'{x:.3f}' for x in scaled_actions])}]")
+        #     self.get_logger().info(f"Target joint positions (q_target): [{', '.join([f'{x:.3f}' for x in joint_positions])}]")
+        #     self.get_logger().info("================================")
         
         return joint_positions
     
+    def send_hold_position_command(self):
+        """Publish current joint positions to hold the robot steady."""
+        # Add back q_default offset to the observed joint positions
+        q_default = np.array([0.0, -0.569, 0.0, -2.810, 0.0, 3.037, 0.741])
+        hold_joint_positions = (self.joint_positions[:7] + q_default).tolist()
+        gripper_command = self.last_action[0, -1].item() if self.last_action is not None else 1.0
+
+        processed_outputs_msg = Float64MultiArray()
+        processed_data = [float(pos) for pos in hold_joint_positions]
+        processed_data.append(float(gripper_command))  # Keep the last gripper command
+        processed_outputs_msg.data = processed_data 
+
+        self.processed_outputs_publisher.publish(processed_outputs_msg)
+        #self.get_logger().info("Published hold position to maintain arm pose during gripper closure.")
+
+    def activate_hold_position(self, duration_sec):
+        """Activate hold position for a specified duration."""
+        self.hold_position_active = True
+        self.hold_position_end_time = self.get_clock().now() + Duration(seconds=duration_sec)
+        #self.get_logger().info(f"Hold position activated for {duration_sec} seconds.")
+
+    def hold_position_step(self):
+        """Periodically send hold position commands while in hold mode."""
+        if not self.hold_position_active:
+            return
+
+        if self.get_clock().now() >= self.hold_position_end_time:
+            self.hold_position_active = False
+            self.get_logger().info("Hold position mode ended.")
+            return
+
+        # Send the hold position command
+        self.send_hold_position_command()
+
+
+
     def execute_action(self, action_dict):
         """Execute the action returned by the policy with safety checks, action_dict contains joint positions and gripper command"""
         # Extract joint positions and gripper command from the action dictionary
         raw_joint_positions = action_dict["joint_positions"]
         # Gripper command is the last element from the policy output
         gripper_command = action_dict["gripper_command"]
+
+        # OVERRIDE GRIPPER COMMAND IF OBJECT IS GRASPED
+        if self.object_grasped:
+            gripper_command = -2.5  # Ensure it stays closed (below -2 threshold)
 
         # --- Joint Position Control ---
         # SAFETY CHECK 1: Validate that we have valid joint positions (not NaN or inf)
@@ -422,11 +485,12 @@ class PolicyRunner(Node):
         # --- End Joint Position Control ---
 
         # --- Gripper Command Execution ---
-        desired_gripper_state = 'closed' if gripper_command <= 0 else 'open'
+        desired_gripper_state = 'closed' if gripper_command <= -1 else 'open'
 
         # Only send a command if the desired state is different from the current goal state
         if desired_gripper_state != self.gripper_goal_state:
             if desired_gripper_state == 'open':
+                self.get_logger().info("Entering gripper open state.")
                 if self.move_client.server_is_ready():
                     self.get_logger().info(f"Sending Move goal (open) - Width: {self.gripper_max_width}, Speed: {self.gripper_speed}")
                     # Create a goal message for the Move action
@@ -441,25 +505,25 @@ class PolicyRunner(Node):
                     self.get_logger().warning("Move action server not ready. Cannot open gripper.")
 
             elif desired_gripper_state == 'closed':
-                if self.grasp_client.server_is_ready():
-                    self.get_logger().info(f"Sending Grasp goal (close) - Width: 0.0, Speed: {self.gripper_speed}, Force: {self.gripper_force}")
-                    self.get_logger().info("Pausing policy execution until grasp completes.")
-                    self.stop() # Pause policy execution
+                self.get_logger().info(f"Sending Grasp goal (close) - Width: 0.0, Speed: {self.gripper_speed}, Force: {self.gripper_force}")
+                self.get_logger().info("Pausing policy execution until grasp completes.")
+                self.stop() # Pause policy execution
+                self.activate_hold_position(duration_sec=0.5) # Activate hold position for 2 seconds
+                # Timer to wait for the gripper to close
 
-                    goal_msg = Grasp.Goal()
-                    goal_msg.width = 0.0 # Target width when grasping (close fully)
-                    goal_msg.speed = self.gripper_speed
-                    goal_msg.force = self.gripper_force
-                    goal_msg.epsilon.inner = self.gripper_epsilon_inner
-                    goal_msg.epsilon.outer = self.gripper_epsilon_outer
+                goal_msg = Grasp.Goal()
+                goal_msg.width = 0.0 # Target width when grasping (close fully)
+                goal_msg.speed = self.gripper_speed
+                goal_msg.force = self.gripper_force
+                goal_msg.epsilon.inner = self.gripper_epsilon_inner
+                goal_msg.epsilon.outer = self.gripper_epsilon_outer
 
-                    # Send goal and register callback for the result
-                    grasp_future = self.grasp_client.send_goal_async(goal_msg)
-                    grasp_future.add_done_callback(self.grasp_goal_response_callback) # Check if goal was accepted
+                # Send goal and register callback for the result
+                # Once the grasp is complete, we resume policy execution
+                grasp_future = self.grasp_client.send_goal_async(goal_msg)
+                grasp_future.add_done_callback(self.grasp_goal_response_callback) # Check if goal was accepted
 
-                    self.gripper_goal_state = 'closed'
-                else:
-                    self.get_logger().warning("Grasp action server not ready. Cannot close gripper.")
+                self.gripper_goal_state = 'closed'
         # --- End Gripper Command Execution ---
 
     def grasp_goal_response_callback(self, future):
@@ -485,6 +549,10 @@ class PolicyRunner(Node):
             if result and result.success:
                 self.get_logger().info("Grasp successful. Object is now attached to end-effector.")
                 self.object_grasped = True # Set the flag
+                self.hold_position_active = False # Deactivate hold position
+                # Resume policy execution only if grasp is successful
+                self.get_logger().info("Resuming policy execution.")
+                self.start()
             else:
                  self.get_logger().warning(f"Grasp action status SUCCEEDED, but result indicates failure: {result.error if result else 'No result object'}")
                  self.object_grasped = False # Ensure flag is false on failure
@@ -497,11 +565,6 @@ class PolicyRunner(Node):
         else:
             self.get_logger().error(f"Grasp action failed with status: {status}")
             self.object_grasped = False # Ensure flag is false on failure
-
-        # Resume policy execution regardless of grasp outcome for now
-        # You might want different logic depending on failure modes
-        self.get_logger().info("Resuming policy execution.")
-        self.start()
 
     def check_state(self):
         """Regular check of the node's state"""

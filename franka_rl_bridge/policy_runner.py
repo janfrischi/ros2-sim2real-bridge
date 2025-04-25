@@ -10,7 +10,7 @@ which subscribes to the /policy_outputs topic.
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, String
 from sensor_msgs.msg import JointState
 import numpy as np
 import time
@@ -76,7 +76,7 @@ class PolicyRunner(Node):
         self.target_position = np.array([0.65, 0.2, 0.5, 1.0, 0.0, 0.0, 0.0])  # x,y,z,qw,qx,qy,qz
         
         # Define object position (this could come from a vision system)
-        self.object_position = np.array([0.5, 0.3, 0.055])  # x,y,z on table
+        self.object_position = np.array([0.5, 0.4, 0.055])  # x,y,z on table
         self.object_grasped = False # Flag to indicate if the object is currently grasped
 
         # Initialize joint positions and velocities
@@ -122,6 +122,9 @@ class PolicyRunner(Node):
             '/policy_outputs',
             10
         )
+        
+        # Create publisher for policy status
+        self.policy_status_publisher = self.create_publisher(String, '/policy_status', 10)
         
         # --- Gripper Control Initialization ---
         self.gripper_goal_state = 'unknown' # 'open', 'closed', 'unknown'
@@ -232,8 +235,8 @@ class PolicyRunner(Node):
     def timer_policy_step(self):
         """Run policy inference and send actions at fixed 100Hz loop."""
         # Run the policy inference if active
-        if self.running:
-            self.run_policy_inference()
+        #if self.running:
+        self.run_policy_inference()
 
     def execute_action(self, action_dict):
         """Execute the action returned by the policy "dictionary" with safety checks"""
@@ -334,7 +337,7 @@ class PolicyRunner(Node):
             elif self.desired_gripper_state == 'closed':
                 self.get_logger().info(f"Sending Grasp goal (close) - Width: 0.0, Speed: {self.gripper_speed}, Force: {self.gripper_force}")
                 self.get_logger().info("Pausing policy execution until grasp completes.")
-                self.stop() # Pause policy execution
+                #self.stop() # Pause policy execution
 
                 # Create a goal message for the Grasp action
                 goal_msg = Grasp.Goal()
@@ -344,23 +347,24 @@ class PolicyRunner(Node):
                 goal_msg.epsilon.inner = self.gripper_epsilon_inner
                 goal_msg.epsilon.outer = self.gripper_epsilon_outer
 
+                self.stop() # Pause policy execution
+
                 # Send goal and register callback for the result
                 # Once the grasp is complete, we resume policy execution
                 grasp_future = self.grasp_client.send_goal_async(goal_msg)
                 grasp_future.add_done_callback(self.grasp_goal_response_callback) # Check if goal was accepted
 
-                # Send current joint positions to hold the robot steady
-                processed_outputs_msg = Float64MultiArray()
-                # Explicitly convert all values to Python float to ensure proper type conversion
-                processed_data = [float(pos) for pos in (self.joint_positions + self.default_joints)]
-                # Append gripper command as the last element -> The output is an 8D vector, 7 joint positions + 1 gripper command
-                processed_data.append(float(gripper_command)) # Keep original gripper command for controller
+                # # Send current joint positions to hold the robot steady
+                # processed_outputs_msg = Float64MultiArray()
+                # # Explicitly convert all values to Python float to ensure proper type conversion
+                # processed_data = [float(pos) for pos in (self.joint_positions[:7] + self.default_joints[:7])]
+                # # Append gripper command as the last element -> The output is an 8D vector, 7 joint positions + 1 gripper command
+                # processed_data.append(float(gripper_command)) # Keep original gripper command for controller
                 
-                # Add processed data to message and publish it
-                processed_outputs_msg.data = processed_data
-                self.policy_outputs_publisher.publish(processed_outputs_msg)
-                self.get_logger().info(f"Processed outputs published to /policy_outputs topic: {processed_data}")
-
+                # # Add processed data to message and publish it
+                # processed_outputs_msg.data = processed_data
+                # self.policy_outputs_publisher.publish(processed_outputs_msg)
+                self.activate_hold_position(2)
                 self.gripper_goal_state = 'closed'
         # --- End Gripper Command Execution ---
 
@@ -415,10 +419,21 @@ class PolicyRunner(Node):
         
         # Run inference at the same frequency as training frequency in simulation
         try:
-            action = self.policy_loader.run_inference(obs)
+            if self.running:
+                action = self.policy_loader.run_inference(obs)
+
+            else: 
+                # If not running, just hold the last action
+                action = self.last_action
+
             # Extract joint positions and gripper command from the action, interpreted action is a dictionary: {"joint_positions": joint_positions, "gripper_command": gripper_command,"gripper_state": gripper_state}
             interpered_actions = self.policy_loader.interpret_action(action)
+
+            # Update the last action
+            self.last_action = action.detach().clone()
+            
             # Log the interpreted action
+            self.get_logger().info(f"Last action: {action}")
             self.get_logger().info(f"Interpreted action: {interpered_actions}")
             
             # --- Compose interpered_actions as a list for logging ---
@@ -436,9 +451,6 @@ class PolicyRunner(Node):
                 last_action_np,
                 interpered_actions_vec  # <-- Log interpered_actions
             ])
-            
-            # Update the last action
-            self.last_action = action.detach().clone()
             
             # Send control commands to the robot, joint commands are handled in cartesian_impedance_controller, gripper command is handled here
             self.execute_action(interpered_actions)
@@ -581,14 +593,22 @@ class PolicyRunner(Node):
         self.was_running_previously = self.running
         
     def start(self):
-        """Start the policy execution"""
+        """Resume policy execution."""
         self.running = True
-        self.get_logger().info("Policy execution started")
+        # Publish status update
+        status_msg = String()
+        status_msg.data = "resumed"
+        self.policy_status_publisher.publish(status_msg)
+        self.get_logger().info("Policy execution resumed.")
         
     def stop(self):
-        """Stop the policy execution"""
+        """Pause policy execution."""
         self.running = False
-        self.get_logger().info("Policy execution stopped")
+        # Publish status update
+        status_msg = String()
+        status_msg.data = "paused"
+        self.policy_status_publisher.publish(status_msg)
+        self.get_logger().info("Policy execution paused.")
 
     def reset_to_home(self):
         """Reset the robot to home position and open gripper."""
@@ -603,7 +623,6 @@ class PolicyRunner(Node):
         # Reset the object position 
         self.object_position = np.array([0.5, 0.3, 0.055])  # Reset to initial position
         # Reset the gripper state
-        self.gripper_goal_state = 'unknown'  # Reset gripper state
         self.desired_gripper_state = 'open'  # Reset desired gripper state
 
         # Send robot to home position

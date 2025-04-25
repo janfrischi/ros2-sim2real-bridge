@@ -23,6 +23,7 @@ setup(
             'joint_state_listener = franka_rl_bridge.joint_state_listener:main',
             'policy_inference = franka_rl_bridge.policy_inference:main',
             'policy_runner = franka_rl_bridge.policy_runner:main',
+            'policy_plotter = franka_rl_bridge.policy_plotter:main',
         ],
     },
 )

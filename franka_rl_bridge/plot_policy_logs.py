@@ -9,7 +9,9 @@ file_path = "/home/pdzuser/franka_ros2_ws/src/franka_rl_bridge/franka_rl_bridge/
 df = pd.read_csv(file_path)
 
 # Convert stringified lists to actual lists
-columns_to_convert = ["joint_positions", "joint_velocities", "object_position", "target_position", "last_action"]
+columns_to_convert = [
+    "joint_positions", "joint_velocities", "object_position", "target_position", "last_action", "interpered_actions"
+]
 for col in columns_to_convert:
     # Preprocess the column to fix formatting issues
     df[col] = df[col].str.replace(r"\s+", ", ", regex=True)  # Replace spaces with commas
@@ -63,3 +65,4 @@ create_plot(df, "joint_accelerations", "Joint Accelerations Over Time")  # New p
 create_plot(df, "object_position", "Object Position Over Time")
 create_plot(df, "target_position", "Target Position Over Time")
 create_plot(df, "last_action", "Last Action Over Time")
+create_plot(df, "interpered_actions", "Interpered Actions Over Time")  # <-- Add this plot

@@ -10,7 +10,9 @@ file_path = "/home/pdzuser/franka_ros2_ws/src/franka_rl_bridge/franka_rl_bridge/
 df = pd.read_csv(file_path)
 
 # Convert stringified lists to actual lists
-columns_to_convert = ["joint_positions", "joint_velocities", "object_position", "target_position", "last_action"]
+columns_to_convert = [
+    "joint_positions", "joint_velocities", "object_position", "target_position", "last_action", "interpered_actions"
+]
 for col in columns_to_convert:
     df[col] = df[col].str.replace(r"\s+", ", ", regex=True)
     df[col] = df[col].str.replace(r",\s*,", ", ", regex=True)
@@ -123,3 +125,4 @@ create_and_save_plot(df, "joint_accelerations", "Joint Accelerations Over Time",
 create_and_save_plot(df, "object_position", "Object Position Over Time", "object_position.svg")
 create_and_save_plot(df, "target_position", "Target Position Over Time", "target_position.svg")
 create_and_save_plot(df, "last_action", "Last Action Over Time", "last_action.svg")
+create_and_save_plot(df, "interpered_actions", "Interpered Actions Over Time", "interpered_actions.svg")

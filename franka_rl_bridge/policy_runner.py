@@ -131,8 +131,8 @@ class PolicyRunner(Node):
         self.gripper_max_width = 0.08 # Max width for Franka Hand
         self.gripper_speed = 0.05 # Default speed (m/s)
         self.gripper_force = 30.0 # Default grasp force (N)
-        self.gripper_epsilon_inner = 0.002 # Tolerance for successful grasp
-        self.gripper_epsilon_outer = 0.002
+        self.gripper_epsilon_inner = 0.03 # Tolerance for successful grasp
+        self.gripper_epsilon_outer = 0.03
 
         # Action clients for gripper, Homing, Move and Grasp are action definitions
         self.homing_client = ActionClient(self, Homing, '/fr3_gripper/homing', callback_group=self.callback_group)
@@ -163,7 +163,7 @@ class PolicyRunner(Node):
         self.get_logger().info("Policy execution timer started at 100Hz")
 
         # Keep robot steady during gripper closure
-        self.hold_position_timer = self.create_timer(0.01, self.hold_position_step, callback_group=self.callback_group)
+        #self.hold_position_timer = self.create_timer(0.01, self.hold_position_step, callback_group=self.callback_group)
 
     # Helper to wait for action servers, using the .wait_for_server() method
     def wait_for_action_server(self, client, name):
@@ -302,7 +302,15 @@ class PolicyRunner(Node):
             
             # Add processed data to message and publish it
             processed_outputs_msg.data = processed_data
+
+            #if self.hold_position_active:
+                #self.send_hold_position_command()
+
+            # else:
+            #     self.policy_outputs_publisher.publish(processed_outputs_msg)
             self.policy_outputs_publisher.publish(processed_outputs_msg)
+
+            self.get_logger().info(f"Processed outputs execution published: {processed_data}")
 
         except Exception as e:
             self.get_logger().error(f"Error publishing processed outputs: {e}")
@@ -371,10 +379,6 @@ class PolicyRunner(Node):
     def run_policy_inference(self):
         """Run the loaded policy on current observations"""
         
-        # Dynamically update the object position if grasped
-        if self.object_grasped:
-            self.object_position = self.ee_pos.copy()
-            
         # Create observation for policy 
         obs = self.policy_loader.create_observation(
             joint_pos=self.joint_positions,
@@ -383,6 +387,10 @@ class PolicyRunner(Node):
             target_pos=self.target_position
         )
         
+        # Dynamically update the object position if grasped
+        if self.object_grasped:
+            self.object_position = self.ee_pos.copy()
+
         # Increment print counter
         self.print_counter += 1
 
@@ -419,19 +427,25 @@ class PolicyRunner(Node):
         
         # Run inference at the same frequency as training frequency in simulation
         try:
-            if self.running:
-                action = self.policy_loader.run_inference(obs)
+            pre_action = self.policy_loader.run_inference(obs)
+            if self.running: 
+                action = pre_action
 
             else: 
+                action = self.last_action
+                action[0][7] = pre_action[0][7]  # Keep the last action for the gripper command
+            if not self.running: 
                 # If not running, just hold the last action
                 action = self.last_action
+                self.get_logger().info(f"Last action: {action}")
+                self.get_logger().info("Policy inference not running, holding last action.")
 
             # Extract joint positions and gripper command from the action, interpreted action is a dictionary: {"joint_positions": joint_positions, "gripper_command": gripper_command,"gripper_state": gripper_state}
             interpered_actions = self.policy_loader.interpret_action(action)
 
             # Update the last action
             self.last_action = action.detach().clone()
-            
+
             # Log the interpreted action
             self.get_logger().info(f"Last action: {action}")
             self.get_logger().info(f"Interpreted action: {interpered_actions}")
@@ -518,7 +532,8 @@ class PolicyRunner(Node):
         processed_outputs_msg.data = processed_data 
 
         self.policy_outputs_publisher.publish(processed_outputs_msg)
-        #self.get_logger().info("Published hold position to maintain arm pose during gripper closure.")
+        self.get_logger().info("Published hold position to maintain arm pose during gripper closure.")
+        self.get_logger().info(f"Processed data hold position: {processed_data}")
 
     def activate_hold_position(self, duration_sec):
         """Activate hold position for a specified duration."""

@@ -129,7 +129,7 @@ class PolicyLoader:
         return ActorCriticPolicy(input_dim, output_dim).to(self.device)
 
     # Create observation for the policy   
-    def create_test_observation(self, 
+    def create_observation(self, 
                                joint_pos: np.ndarray = None, 
                                joint_vel: np.ndarray = None,
                                object_pos: np.ndarray = None,

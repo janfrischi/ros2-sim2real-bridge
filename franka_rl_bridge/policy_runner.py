@@ -126,6 +126,7 @@ class PolicyRunner(Node):
         
         # Create publisher for policy status
         self.policy_status_publisher = self.create_publisher(String, '/policy_status', 10)
+        self.get_logger().info("Created publisher for /policy_status topic")
         
         # --- Gripper Control Initialization ---
         self.gripper_goal_state = 'unknown' # 'open', 'closed', 'unknown'
@@ -151,6 +152,7 @@ class PolicyRunner(Node):
         # Initialize running flag and timer
         self.running = False
         self.was_running_previously = False
+        self.was_holding_previously = False
         self.create_timer(0.1, self.check_state)  # Regular state check
         
         # Initialize print counter
@@ -306,51 +308,21 @@ class PolicyRunner(Node):
         # Replace the original joint positions with the clamped ones
         joint_positions = clamped_joint_positions
 
-        # ---Determine action based on running state---
-        # CASE 1: Policy is running normally
-        if self.running and not self.hold_position_active:
-            # Publish joint position commands to the /policy_outputs topic
-            try: 
-                processed_policy_outputs_msg = Float64MultiArray()
-                processed_data = [float(pos) for pos in joint_positions]
-                processed_data.append(float(gripper_command))
-                processed_policy_outputs_msg.data = processed_data
-                self.policy_outputs_publisher.publish(processed_policy_outputs_msg)
-
-                if self.print_counter % self.print_frequency == 0:
-                    self.get_logger().info(f"Published policy outputs: {processed_data}")
-            except Exception as e:
-                self.get_logger().error(f"Error publishing policy outputs: {e}")
-                return
-            
-            # Handle gripper command
-            self.desired_gripper_state = 'closed' if gripper_command <= -1 else 'open'
-
-            # Execute gripper action if the state has changed
-            if self.desired_gripper_state != self.gripper_goal_state:
-                if self.desired_gripper_state == 'open' and not self.object_grasped:
-                    self.open_gripper()
-                elif self.desired_gripper_state == 'closed':
-                    # Store the current position for holding
-                    self.hold_position = joint_positions.copy()
-                    self.stop()  # Pause policy execution
-                    # Enter hold mode
-                    self.hold_position_active = True
-                    # Send the grasp command
-                    self.close_gripper()
-
-        # CASE 2: Policy is paused (hold position during gripper closure)
-        elif self.hold_position_active:
-            # Only publish the hold position message and log at the print frequency
-            hold_policy_outputs_msg = Float64MultiArray()
-            processed_data = [float(pos) for pos in self.hold_position]
+        # Publish joint position commands to the /policy_outputs topic
+        try: 
+            processed_policy_outputs_msg = Float64MultiArray()
+            processed_data = [float(pos) for pos in joint_positions]
             processed_data.append(float(gripper_command))
-            hold_policy_outputs_msg.data = processed_data
-            self.policy_outputs_publisher.publish(hold_policy_outputs_msg)
+            processed_policy_outputs_msg.data = processed_data
             
-            # Only log at the print frequency to avoid spamming
-            if self.print_counter % self.print_frequency == 0:
-                self.get_logger().info("Holding position during gripper closure...")
+            # Publish the processed policy outputs
+            self.policy_outputs_publisher.publish(processed_policy_outputs_msg)
+            
+            if self.print_counter % self.print_frequency == 0:  # Only log occasionally
+                self.get_logger().info(f"Published policy outputs: {processed_data}")
+        except Exception as e:
+            self.get_logger().error(f"Error publishing policy outputs: {e}")
+            return
 
     def open_gripper(self):
         """Open the gripper using the action client"""
@@ -415,43 +387,99 @@ class PolicyRunner(Node):
             self.execute_action(safe_action_dict)
             return
         
-        # Run inference .run_inference() method is defined in the PolicyLoader class
         try:
-            # Run inference on the observations
-            pre_action = self.policy_loader.run_inference(obs)
-            
-            # Policy is running, so we can use the action
-            if self.running or self.hold_position_active: 
-                action = pre_action
-            else:
-                # If not running, just hold the last action
-                action = self.last_action.clone()
+            # CASE 1: Policy is running normally
+            if self.running:
+                # Run inference on the observations
+                action = self.policy_loader.run_inference(obs)
+                # Extract joint positions and gripper command from the action
+                interpreted_actions = self.policy_loader.interpret_action(action)
+                # Update the last action
+                self.last_action = action.detach().clone()
                 
-            # Extract joint positions and gripper command from the action, interpreted action is a dictionary: {"joint_positions": joint_positions, "gripper_command": gripper_command,"gripper_state": gripper_state}
-            interpreted_actions = self.policy_loader.interpret_action(action)
+                # --- Compose interpreted_actions as a list for logging ---
+                interpreted_actions_vec = list(interpreted_actions["joint_positions"]) + [interpreted_actions["gripper_command"]]
+                
+                # Log observations and actions to CSV
+                timestamp = time.time()
+                last_action_np = action.detach().cpu().numpy()[0]
+                self.csv_writer.writerow([
+                    timestamp,
+                    self.joint_positions.tolist(),
+                    self.joint_velocities.tolist(),
+                    self.object_position.tolist(),
+                    self.target_position.tolist(),
+                    last_action_np,
+                    interpreted_actions_vec
+                ])
+                
+                # Handle gripper command
+                gripper_command = interpreted_actions["gripper_command"]
+                desired_gripper_state = 'closed' if gripper_command <= -1 else 'open'
+                
+                # Execute gripper action if the state has changed
+                if desired_gripper_state != self.gripper_goal_state:
+                    if desired_gripper_state == 'open' and not self.object_grasped:
+                        self.open_gripper()
+                    elif desired_gripper_state == 'closed':
+                        # Store current joint positions for holding
+                        processed_joint_positions = self.joint_positions[:7] + self.default_joints[:7]
+                        self.get_logger().info(f"Holding position: {processed_joint_positions}")
+                        self.hold_position = processed_joint_positions.copy()
+                        # Enter hold mode
+                        self.hold_position_active = True
+                        self.stop()  # Pause policy execution
+                        # Send the grasp command
+                        self.close_gripper()
+                        return  # Skip normal action execution
+                
+                # Send control commands to the robot for normal execution
+                self.execute_action(interpreted_actions)
 
-            # Update the last action
-            self.last_action = action.detach().clone()
+            # CASE 2: Policy is in hold position mode (during gripper closure)
+            elif self.hold_position_active:
+                # Only publish the hold position message
+                hold_policy_outputs_msg = Float64MultiArray()
+                processed_data = [float(pos) for pos in self.hold_position]
+                # Use the last gripper command
+                gripper_command = float(self.last_action[0, -1].item()) if self.last_action is not None else 1.0
+                processed_data.append(gripper_command)
+                hold_policy_outputs_msg.data = processed_data
 
-            # --- Compose interpreted_actions as a list for logging ---
-            interpered_actions_vec = list(interpreted_actions["joint_positions"]) + [interpreted_actions["gripper_command"]]
-
-            # Log observations and actions to CSV
-            timestamp = time.time()
-            last_action_np = self.last_action.detach().cpu().numpy()[0] if self.last_action is not None else [None] * 8
-            self.csv_writer.writerow([
-                timestamp,
-                self.joint_positions.tolist(),
-                self.joint_velocities.tolist(),
-                self.object_position.tolist(),
-                self.target_position.tolist(),
-                last_action_np,
-                interpered_actions_vec
-            ])
+                # Publish the hold position message
+                self.policy_outputs_publisher.publish(hold_policy_outputs_msg)
+                if self.print_counter % self.print_frequency == 0:  # Only log occasionally
+                    self.get_logger().info(f"Published hold position outputs: {processed_data}")
+                
+                # Log observations and actions to CSV
+                timestamp = time.time()
+                last_action_np = self.last_action.detach().cpu().numpy()[0] if self.last_action is not None else [None] * 8
+                self.csv_writer.writerow([
+                    timestamp,
+                    self.joint_positions.tolist(),
+                    self.joint_velocities.tolist(),
+                    self.object_position.tolist(),
+                    self.target_position.tolist(),
+                    last_action_np,
+                    processed_data
+                ])
+                return  # Skip normal policy inference while in hold mode
             
-            # Send control commands to the robot, joint commands are handled in cartesian_impedance_controller, gripper command is handled here
-            self.execute_action(interpreted_actions)
-            
+            # # CASE 3: Policy is paused (not running and not in hold position)
+            # else:
+            #     # For logging purposes, create entry with last action
+            #     timestamp = time.time()
+            #     last_action_np = self.last_action.detach().cpu().numpy()[0] if self.last_action is not None else [None] * 8
+            #     self.csv_writer.writerow([
+            #         timestamp,
+            #         self.joint_positions.tolist(),
+            #         self.joint_velocities.tolist(),
+            #         self.object_position.tolist(),
+            #         self.target_position.tolist(),
+            #         last_action_np,
+            #         [None] * 8  # No interpreted action when paused
+            #     ])
+                
         except Exception as e:
             self.get_logger().error(f"Error running policy inference: {e}")
 

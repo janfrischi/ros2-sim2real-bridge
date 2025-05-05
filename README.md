@@ -77,15 +77,6 @@ This package successfully bridges the simulation-to-reality (sim2real) gap by im
 
 With these features, policies trained in simulation can be directly deployed on the physical Franka robot with minimal adjustments, reducing development time and hardware wear.
 
-## Usage
-
-You can run the provided scripts as ROS 2 nodes. For example:
-```bash
-ros2 run franka_rl_bridge joint_state_listener
-ros2 run franka_rl_bridge policy_inference
-ros2 run franka_rl_bridge policy_runner
-```
-
 ## Running the Package
 
 ```bash

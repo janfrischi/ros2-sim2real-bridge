@@ -29,7 +29,7 @@ class PolicyLoader:
         self.arm_joint_dim = 7  # 7 DoF for Franka arm
         self.finger_joint_dim = 2  # 2 joints for the gripper fingers
         self.joint_dim = self.arm_joint_dim + self.finger_joint_dim  # 9 total joints
-        self.obj_pos_dim = 3  # x, y, z position of the object 
+        self.obj_pos_dim = 7  # x, y, z + quaternion (4) position of the object 
         self.target_pos_dim = 7  # position (3) + quaternion (4)
         self.action_dim = 8  # 7 joint positions + 1 gripper command "Output of the policy -> Can be then used by controller"
         
@@ -74,11 +74,11 @@ class PolicyLoader:
     def create_policy_model(self):
         """Create an instance of the policy model with the right architecture.
         RSL-RL algorithm uses Actor-Critic architecture for the policy model."""
-        
+
         class ActorCriticPolicy(nn.Module):
             def __init__(self, input_dim, output_dim):
                 super(ActorCriticPolicy, self).__init__()
-                
+
                 # Actor network - this is what we use for inference, actor learns mapping from states to actions
                 self.actor = nn.Sequential(
                     nn.Linear(input_dim, 256),
@@ -89,7 +89,7 @@ class PolicyLoader:
                     nn.ELU(alpha=1.0),
                     nn.Linear(64, output_dim)
                 )
-                
+
                 # Critic network - not used during inference but needed for model loading
                 self.critic = nn.Sequential(
                     nn.Linear(input_dim, 256),
@@ -100,11 +100,11 @@ class PolicyLoader:
                     nn.ELU(alpha=1.0),
                     nn.Linear(64, 1)
                 )
-                
+
                 # Standard deviation parameter
                 self.register_buffer('std', torch.ones(output_dim))
-            
-            # Forward pass for the model, x is the input tensor of shape (36,1)
+
+            # Forward pass for the model, x is the input tensor of shape (40,1) # Updated comment
             # This is the function that gets called when we do action = policy(obs)
             def forward(self, x):
                 # If input is a dict, convert to tensor
@@ -114,18 +114,19 @@ class PolicyLoader:
                         x["joint_pos"],
                         x["joint_vel"],
                         x["object_position"],
+                        x["object_orientation"], # Added object_orientation here
                         x["target_object_position"],
                         x["actions"]
                     ], dim=1)
-                    
+
                 # For inference we only need the actor output
                 return self.actor(x)
-        
-        # The input size is 36 as specified in your model
-        input_dim = 36  
+
+        # The input size is 40 now (36 original + 4 object orientation)
+        input_dim = 40 # Updated input dimension
         # The output is 8 actions (7 joints + 1 gripper command)
-        output_dim = 8  
-        
+        output_dim = 8
+
         return ActorCriticPolicy(input_dim, output_dim).to(self.device)
 
     # Create observation for the policy   
@@ -133,6 +134,7 @@ class PolicyLoader:
                                joint_pos: np.ndarray = None, 
                                joint_vel: np.ndarray = None,
                                object_pos: np.ndarray = None,
+                               object_orientation: np.ndarray = None,
                                target_pos: np.ndarray = None) -> Dict[str, torch.Tensor]:
         
         """Create a test observation for the policy."""
@@ -146,6 +148,9 @@ class PolicyLoader:
         if object_pos is None:
             # Default object position on table
             object_pos = np.array([0.5, 0.3, 0.055])
+        if object_orientation is None:
+            # Default object orientation (identity quaternion: qw, qx, qy, qz)
+            object_orientation = np.array([1.0, 0.0, 0.0, 0.0])
         if target_pos is None:
             # Default target position above table: position (x,y,z) + quaternion (w,x,y,z)
             target_pos = np.array([0.5, 0, 0.1, 1.0, 0, 0, 0])
@@ -154,6 +159,7 @@ class PolicyLoader:
         joint_pos_tensor = torch.tensor(joint_pos, dtype=torch.float32, device=self.device).unsqueeze(0)
         joint_vel_tensor = torch.tensor(joint_vel, dtype=torch.float32, device=self.device).unsqueeze(0)
         object_pos_tensor = torch.tensor(object_pos, dtype=torch.float32, device=self.device).unsqueeze(0)
+        object_orientation_tensor = torch.tensor(object_orientation, dtype=torch.float32, device=self.device).unsqueeze(0)
         target_pos_tensor = torch.tensor(target_pos, dtype=torch.float32, device=self.device).unsqueeze(0)
         
         # Create observation dictionary (for policies that expect dictionary input)
@@ -161,6 +167,7 @@ class PolicyLoader:
             "joint_pos": joint_pos_tensor,
             "joint_vel": joint_vel_tensor,
             "object_position": object_pos_tensor,
+            "object_orientation": object_orientation_tensor,
             "target_object_position": target_pos_tensor,
             "actions": self.last_action
         }
@@ -170,19 +177,20 @@ class PolicyLoader:
             joint_pos_tensor,
             joint_vel_tensor,
             object_pos_tensor,
+            object_orientation_tensor,
             target_pos_tensor,
             self.last_action
         ], dim=1)
         
         # Verify the dimensions match what the model expects
-        expected_dim = 36
+        expected_dim = 40
         actual_dim = obs_concat.shape[1]
         # Print a warning if the dimensions don't match
         if actual_dim != expected_dim:
             print(f"Warning: Model expects input dimension {expected_dim}, but got {actual_dim}")
             print(f"Dimensions: joint_pos={joint_pos_tensor.shape[1]}, joint_vel={joint_vel_tensor.shape[1]}, " +
-                  f"object_pos={object_pos_tensor.shape[1]}, target_pos={target_pos_tensor.shape[1]}, " +
-                  f"actions={self.last_action.shape[1]}")
+                   f"object_pos={object_pos_tensor.shape[1]}, object_orientation={object_orientation_tensor.shape[1]}, " +
+                   f"target_pos={target_pos_tensor.shape[1]}, actions={self.last_action.shape[1]}")
         
         # Return a dict containing both the dictionary and tensor representations
         # This allows the model to be flexible in terms of input format
@@ -237,23 +245,26 @@ class PolicyLoader:
         print("\n=== Franka Lift Cube Policy Inference Tester ===\n")
         print("This tool helps test policy inference for the Franka Lift Cube task.")
         print("You can input observations and see the resulting actions.\n")
-        
+
         while True:
             print("\n=== Testing Options ===")
             print("1. Test with default values")
             print("2. Test with custom joint positions")
             print("3. Test with custom object position")
-            print("4. Test with custom target position")
-            print("5. Test with all custom values")
+            print("4. Test with custom object orientation (quaternion: qw qx qy qz)")
+            print("5. Test with custom target position")
+            print("6. Test with all custom values")
             print("q. Quit")
-            
+
             choice = input("\nEnter choice: ")
-            
+
             if choice == 'q':
                 break
-                
+
+            obs = None # Initialize obs
+
             if choice == '1':
-                obs = self.create_test_observation()
+                obs = self.create_observation()
             elif choice == '2':
                 print("\nEnter 9 joint position values separated by spaces (-1 to 1 range):")
                 print("(7 arm joints + 2 finger joints)")
@@ -262,91 +273,102 @@ class PolicyLoader:
                     if len(values) != 9:
                         print(f"Expected 9 values, got {len(values)}. Using zeros instead.")
                         values = np.zeros(9)
-                    obs = self.create_test_observation(joint_pos=values)
+                    obs = self.create_observation(joint_pos=values)
                 except ValueError:
                     print("Invalid input. Using default values.")
-                    obs = self.create_test_observation()
+                    obs = self.create_observation()
             elif choice == '3':
                 print("\nEnter 3 object position values (x, y, z) separated by spaces:")
                 try:
                     values = list(map(float, input().split()))
                     if len(values) != 3:
                         print(f"Expected 3 values, got {len(values)}. Using defaults instead.")
-                        values = np.array([0.5, 0, 0.055])
-                    obs = self.create_test_observation(object_pos=values)
+                        values = np.array([0.5, 0.3, 0.055]) # Updated default to match PolicyRunner
+                    obs = self.create_observation(object_pos=values)
                 except ValueError:
                     print("Invalid input. Using default values.")
-                    obs = self.create_test_observation()
-            elif choice == '4':
+                    obs = self.create_observation()
+            elif choice == '4': # Added case for object orientation
+                print("\nEnter 4 object orientation values (qw, qx, qy, qz) separated by spaces:")
+                try:
+                    values = list(map(float, input().split()))
+                    if len(values) != 4:
+                        print(f"Expected 4 values, got {len(values)}. Using defaults instead.")
+                        values = np.array([1.0, 0.0, 0.0, 0.0]) # Default identity quaternion
+                    obs = self.create_observation(object_orientation=values)
+                except ValueError:
+                    print("Invalid input. Using default values.")
+                    obs = self.create_observation()
+            elif choice == '5': # Renumbered
                 print("\nEnter 7 target position values (x, y, z, qw, qx, qy, qz) separated by spaces:")
                 try:
                     values = list(map(float, input().split()))
                     if len(values) != 7:
                         print(f"Expected 7 values, got {len(values)}. Using defaults instead.")
-                        values = np.array([0.5, 0, 0.3, 1.0, 0, 0, 0])
-                    obs = self.create_test_observation(target_pos=values)
+                        values = np.array([0.5, 0, 0.1, 1.0, 0, 0, 0]) # Updated default
+                    obs = self.create_observation(target_pos=values)
                 except ValueError:
                     print("Invalid input. Using default values.")
-                    obs = self.create_test_observation()
-            elif choice == '5':
+                    obs = self.create_observation()
+            elif choice == '6': # Renumbered
                 try:
-                    print("\nEnter 9 joint position values separated by spaces:")
-                    print("(7 arm joints + 2 finger joints)")
+                    print("\nEnter 9 joint position values:")
                     joint_pos = list(map(float, input().split()))
-                    if len(joint_pos) != 9:
-                        print(f"Expected 9 values, got {len(joint_pos)}. Using zeros.")
-                        joint_pos = np.zeros(9)
-                        
-                    print("\nEnter 9 joint velocity values separated by spaces:")
-                    print("(7 arm joints + 2 finger joints)")
+                    if len(joint_pos) != 9: raise ValueError("Expected 9 joint pos values")
+
+                    print("\nEnter 9 joint velocity values:")
                     joint_vel = list(map(float, input().split()))
-                    if len(joint_vel) != 9:
-                        print(f"Expected 9 values, got {len(joint_vel)}. Using zeros.")
-                        joint_vel = np.zeros(9)
-                        
-                    print("\nEnter 3 object position values (x, y, z) separated by spaces:")
+                    if len(joint_vel) != 9: raise ValueError("Expected 9 joint vel values")
+
+                    print("\nEnter 3 object position values (x, y, z):")
                     object_pos = list(map(float, input().split()))
-                    if len(object_pos) != 3:
-                        print(f"Expected 3 values, got {len(object_pos)}. Using defaults.")
-                        object_pos = np.array([0.5, 0, 0.055])
-                        
-                    print("\nEnter 7 target position values (x, y, z, qw, qx, qy, qz) separated by spaces:")
+                    if len(object_pos) != 3: raise ValueError("Expected 3 object pos values")
+
+                    print("\nEnter 4 object orientation values (qw, qx, qy, qz):") # Added
+                    object_orientation = list(map(float, input().split()))
+                    if len(object_orientation) != 4: raise ValueError("Expected 4 object orientation values")
+
+                    print("\nEnter 7 target position values (x, y, z, qw, qx, qy, qz):")
                     target_pos = list(map(float, input().split()))
-                    if len(target_pos) != 7:
-                        print(f"Expected 7 values, got {len(target_pos)}. Using defaults.")
-                        target_pos = np.array([0.5, 0, 0.3, 1.0, 0, 0, 0])
-                        
-                    obs = self.create_test_observation(
-                        joint_pos=joint_pos,
-                        joint_vel=joint_vel,
-                        object_pos=object_pos,
-                        target_pos=target_pos
+                    if len(target_pos) != 7: raise ValueError("Expected 7 target pos values")
+
+                    obs = self.create_observation(
+                        joint_pos=np.array(joint_pos),
+                        joint_vel=np.array(joint_vel),
+                        object_pos=np.array(object_pos),
+                        object_orientation=np.array(object_orientation), # Added
+                        target_pos=np.array(target_pos)
                     )
-                except ValueError:
-                    print("Invalid input. Using default values.")
-                    obs = self.create_test_observation()
+                except ValueError as e:
+                    print(f"Invalid input: {e}. Using default values.")
+                    obs = self.create_observation()
             else:
                 print("Invalid choice. Using default values.")
-                obs = self.create_test_observation()
-            
-            print("\n=== Input Observations ===")
-            for key, value in obs["dict"].items():
-                print(f"{key}: {value.cpu().numpy()}")
-                
-            print("\n=== Running Inference ===")
-            try:
-                action = self.run_inference(obs)
-                print(f"Raw action: {action.cpu().numpy()}")
-                
-                interpreted = self.interpret_action(action)
-                print("\n=== Interpreted Action ===")
-                print(f"Joint positions: {interpreted['joint_positions']}")
-                print(f"Gripper command: {interpreted['gripper_command']} ({interpreted['gripper_state']})")
-            except Exception as e:
-                print(f"Error running inference: {e}")
-            
-            print("\n=== Observation Dimensions ===")
-            print(f"Total observation size: {obs['tensor'].shape[1]}")
+                obs = self.create_observation()
+
+            if obs is not None: # Check if obs was created
+                print("\n=== Input Observations ===")
+                for key, value in obs["dict"].items():
+                    # Check if value is a tensor before calling .cpu().numpy()
+                    if isinstance(value, torch.Tensor):
+                         print(f"{key}: {value.cpu().numpy()}")
+                    else:
+                         print(f"{key}: {value}") # Should not happen with current structure, but safe check
+
+                print("\n=== Running Inference ===")
+                try:
+                    action = self.run_inference(obs)
+                    print(f"Raw action: {action.cpu().numpy()}")
+
+                    interpreted = self.interpret_action(action)
+                    print("\n=== Interpreted Action ===")
+                    print(f"Joint positions: {interpreted['joint_positions']}")
+                    print(f"Gripper command: {interpreted['gripper_command']} ({interpreted['gripper_state']})")
+                except Exception as e:
+                    print(f"Error running inference: {e}")
+
+                print("\n=== Observation Dimensions ===")
+                print(f"Total observation size (tensor): {obs['tensor'].shape[1]}")
 
 def main():
     # Parse command line arguments

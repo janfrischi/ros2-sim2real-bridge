@@ -11,6 +11,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray, String
 from sensor_msgs.msg import JointState
+from geometry_msgs.msg import PoseStamped  # Add PoseStamped import
 import numpy as np
 import time
 import argparse
@@ -21,6 +22,7 @@ import torch
 from rclpy.action import ActionClient
 from franka_msgs.action import Homing, Move, Grasp
 from action_msgs.msg import GoalStatus
+from rclpy.duration import Duration
 from franka_rl_bridge.policy_inference import PolicyLoader
 
 # Define the PolicyRunner node -> Load the policy, receive joint states, run inference, send control commands
@@ -30,7 +32,7 @@ class PolicyRunner(Node):
         super().__init__('policy_runner')
 
         # Define the path for the CSV log file in the franka_rl_bridge package
-        logs_dir = "/home/pdzuser/franka_ros2_ws/src/franka_rl_bridge/franka_rl_bridge"
+        logs_dir = "/home/chris/franka_ros2_ws/src/franka_rl_bridge/franka_rl_bridge"
         self.log_file_path = os.path.join(logs_dir, "policy_logs.csv")
         
         # Open the CSV file for writing
@@ -42,7 +44,8 @@ class PolicyRunner(Node):
             "timestamp", 
             "joint_positions", 
             "joint_velocities", 
-            "object_position", 
+            "object_position",
+            "object_orientation", 
             "target_position", 
             "last_action",
             "interpreted_actions"
@@ -58,8 +61,10 @@ class PolicyRunner(Node):
         self.target_position = np.array([0.65, 0.2, 0.5, 1.0, 0.0, 0.0, 0.0])  # x,y,z,qw,qx,qy,qz
         
         # Define object position (this could come from a vision system)
-        self.object_position = np.array([0.5, 0.4, 0.055])  # x,y,z on table
+        self.object_position = np.array([0.4, -0.2, 0.055])  # x,y,z on table - default value if no perception data
+        self.object_orientation = np.array([1.0, 0.0, 0.0, 0.0]) # Default orientation (identity quaternion)
         self.object_grasped = False # Flag to indicate if the object is currently grasped
+        self.object_position_received = False  # Flag to track if we've received object position data
 
         # Initialize joint positions and velocities
         self.joint_positions = np.array([0.0, -0.569, 0.0, -2.810, 0.0, 3.037, 0.741, 0.0, 0.0])
@@ -89,6 +94,16 @@ class PolicyRunner(Node):
             10,
             callback_group=self.callback_group
         )
+        
+        # Create subscription to object pose from perception system
+        self.object_pose_subscription = self.create_subscription(
+            PoseStamped,
+            '/perception/object_pose',
+            self.object_pose_callback,
+            10,
+            callback_group=self.callback_group
+        )
+        self.get_logger().info("Subscribed to /perception/object_pose topic")
            
         # Create publisher for processed policy outputs -> Cartesian Impedance Controller subscribes to this topic
         self.policy_outputs_publisher = self.create_publisher(
@@ -106,8 +121,8 @@ class PolicyRunner(Node):
         self.gripper_max_width = 0.08 # Max width for Franka Hand
         self.gripper_speed = 0.05 # Default speed (m/s)
         self.gripper_force = 30.0 # Default grasp force (N)
-        self.gripper_epsilon_inner = 0.01 # Tolerance for successful grasp
-        self.gripper_epsilon_outer = 0.01
+        self.gripper_epsilon_inner = 0.02 # Tolerance for successful grasp
+        self.gripper_epsilon_outer = 0.05
 
         # Action clients for gripper, Homing, Move and Grasp are action definitions
         self.homing_client = ActionClient(self, Homing, '/fr3_gripper/homing', callback_group=self.callback_group)
@@ -187,6 +202,31 @@ class PolicyRunner(Node):
         # Return the relative joint positions
         self.joint_positions = np.concatenate((joint_pos_arm, gripper_pos_processed)) - self.default_joints
         self.joint_velocities = np.concatenate((joint_vel_arm, gripper_vel))
+
+    # Callback for object pose from perception system
+    def object_pose_callback(self, msg):
+        """Process incoming object pose from perception system"""
+        # Extract position from the message
+        x = msg.pose.position.x
+        y = msg.pose.position.y
+        z = msg.pose.position.z
+        
+        # Extract orientation (quaternion) from the message
+        qw = msg.pose.orientation.w
+        qx = msg.pose.orientation.x
+        qy = msg.pose.orientation.y
+        qz = msg.pose.orientation.z
+        
+        # Update object position and orientation
+        self.object_position = np.array([x, y, z])
+        self.object_orientation = np.array([qw, qx, qy, qz])
+        
+        # Set flag to indicate we've received object position data
+        self.object_position_received = True
+        
+        # Debug output (occasionally)
+        if hasattr(self, 'print_counter') and self.print_counter % self.print_frequency == 0:
+            self.get_logger().info(f"Received object position: [{x:.3f}, {y:.3f}, {z:.3f}]")
 
     def process_joint_commands(self, policy_output):
         """Convert policy outputs to joint position commands for the real robot.
@@ -279,7 +319,7 @@ class PolicyRunner(Node):
     def close_gripper(self):
         """Close the gripper using the action client"""
         goal_msg = Grasp.Goal()
-        goal_msg.width = 0.0
+        goal_msg.width = self.gripper_max_width
         goal_msg.speed = self.gripper_speed
         goal_msg.force = self.gripper_force
         goal_msg.epsilon.inner = self.gripper_epsilon_inner
@@ -300,6 +340,7 @@ class PolicyRunner(Node):
             joint_pos=self.joint_positions,
             joint_vel=self.joint_velocities,
             object_pos=self.object_position,
+            object_orientation=self.object_orientation,
             target_pos=self.target_position
         )
         
@@ -331,6 +372,7 @@ class PolicyRunner(Node):
                     self.joint_positions.tolist(),
                     self.joint_velocities.tolist(),
                     self.object_position.tolist(),
+                    self.object_orientation.tolist(),
                     self.target_position.tolist(),
                     last_action_np,
                     interpreted_actions_vec
@@ -386,6 +428,7 @@ class PolicyRunner(Node):
                     self.joint_positions.tolist(),
                     self.joint_velocities.tolist(),
                     self.object_position.tolist(),
+                    self.object_orientation.tolist(),
                     self.target_position.tolist(),
                     last_action_np,
                     self.hold_position["joint_positions"] + [self.hold_position["gripper_command"]]
@@ -453,41 +496,61 @@ class PolicyRunner(Node):
         self.running = False
         self.get_logger().info("Policy execution paused.")
 
+    def reset_state(self):
+        """Reset all internal state variables to their initial values."""
+        self.get_logger().info("Resetting internal policy runner state...")
+
+        # Reset object state
+        self.object_grasped = False
+        self.object_position = np.array([0.5, 0.3, 0.055])  # Example: object back on table
+        self.object_orientation = np.array([1.0, 0.0, 0.0, 0.0])  # Identity quaternion
+
+        # Reset control flags
+        self.hold_position_active = False
+        self.running = False
+        self.was_running_previously = False
+        self.was_holding_previously = False
+
+        # Reset joint state tracking
+        self.joint_positions = np.array([0.0, -0.569, 0.0, -2.810, 0.0, 3.037, 0.741, 0.0, 0.0])
+        self.joint_velocities = np.zeros(9)
+        self.ee_pos = np.zeros(3)
+
+        # Reset gripper state
+        self.gripper_goal_state = 'open'
+
+        # Reset last action
+        self.last_action = torch.zeros((1, self.policy_loader.action_dim), device=self.policy_loader.device)
+
+        # Reset hold position
+        self.hold_position = None
+
+        self.get_logger().info("Internal state successfully reset.")
+
+
     def reset_to_home(self):
         """Reset the robot to home position and open gripper."""
-        # Define home position joint angles
+        self.get_logger().info("Resetting robot to home position...")
+        
+        # Reset internal state
+        self.reset_state()
+
+        # Send home position command to robot
         home_position = [0.0, -0.569, 0.0, -2.810, 0.0, 3.037, 0.741]
-        
-        # Stop policy execution temporarily
-        self.stop()  # Ensure the robot is paused
-        self.object_grasped = False # Ensure object is considered not grasped on reset
-        # Reset the last action
-        self.last_action = torch.zeros((1, self.policy_loader.action_dim), device=self.policy_loader.device)
-        # Reset the object position 
-        self.object_position = np.array([0.5, 0.3, 0.055])  # Reset to initial position
-        # Reset the gripper state
-        self.desired_gripper_state = 'open'  # Reset desired gripper state
 
-        # Send robot to home position
-        self.get_logger().info("Resetting robot to home position and opening gripper")
-        
-        # Publish directly to policy outputs to reset joints
         processed_policy_outputs_msg = Float64MultiArray()
-        processed_data = [float(pos) for pos in home_position]
-        # Append an open gripper command
-        processed_data.append(4.0) 
+        processed_data = home_position + [4.0]  # Append open gripper command
         processed_policy_outputs_msg.data = processed_data
-
         self.policy_outputs_publisher.publish(processed_policy_outputs_msg)
-        # Send the gripper command 
+
+        # Send gripper open command via action client
         goal_msg = Move.Goal()
         goal_msg.width = self.gripper_max_width
         goal_msg.speed = self.gripper_speed
         self.move_client.send_goal_async(goal_msg)
-        self.gripper_goal_state = 'open' # Update state
 
-        # Log that the robot is now in pause mode
-        self.get_logger().info("Robot reset command sent. Policy execution is paused.")
+        self.get_logger().info("Robot reset complete. Policy execution is paused.")
+
 
     def destroy_node(self):
         """Clean up resources when the node is destroyed"""

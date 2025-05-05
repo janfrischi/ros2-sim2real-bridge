@@ -44,6 +44,18 @@
    source ~/franka_ros2_ws/install/setup.bash
    ```
 
+## Sim2Real Bridging
+
+This package successfully bridges the simulation-to-reality (sim2real) gap by implementing:
+
+- Standardized state representation that works across both simulated and real robots
+- Consistent action space mapping for seamless policy transfer
+- Automated domain adaptation to account for dynamics differences
+- Real-time performance optimization for controller execution
+- Robust error handling and safety measures for real robot deployment
+
+With these features, policies trained in simulation can be directly deployed on the physical Franka robot with minimal adjustments, reducing development time and hardware wear.
+
 ## Usage
 
 You can run the provided scripts as ROS 2 nodes. For example:
@@ -53,11 +65,19 @@ ros2 run franka_rl_bridge policy_inference
 ros2 run franka_rl_bridge policy_runner
 ```
 
-## License
+## Running the Package
 
-See `package.xml` for license information.
+```bash
+# Launch the cartesian impedance controller
+ros2 launch cartesian_impedance_control cartesian_impedance_controller.launch.py
 
-## Maintainer
+# Start the joint_state_listener node
+ros2 run franka_rl_bridge joint_state_listener
 
-- pdzuser (<frijan@ethz.ch>)
+# Start the PolicyRunner node to deploy a trained policy (replace path and policy accordingly)
+ros2 run franka_rl_bridge policy_runner --policy /home/pdzuser/franka_ros2_ws/src/franka_rl_bridge/models/model_2999.pt --device cpu
+
+# Launch visualization tools
+ros2 run franka_rl_bridge policy_plotter
+```
 

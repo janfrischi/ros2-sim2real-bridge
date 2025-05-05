@@ -21,7 +21,6 @@ import torch
 from rclpy.action import ActionClient
 from franka_msgs.action import Homing, Move, Grasp
 from action_msgs.msg import GoalStatus
-from rclpy.duration import Duration
 from franka_rl_bridge.policy_inference import PolicyLoader
 
 # Define the PolicyRunner node -> Load the policy, receive joint states, run inference, send control commands

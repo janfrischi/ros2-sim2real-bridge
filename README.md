@@ -10,18 +10,39 @@
   - `plot_policy_logs.py`: Utility for plotting logs generated during policy execution or training.
   - `policy_inference.py`: Script for running inference using a trained RL policy.
   - `policy_runner.py`: Node/script to execute a policy in a ROS 2 environment.
-- `resource/franka_rl_bridge`: Resource file for ROS 2 package indexing.
-- `test/`
-  - `test_copyright.py`: Copyright compliance test.
-  - `test_flake8.py`: Code style test using flake8.
-  - `test_pep257.py`: Docstring style test using pep257.
-- `setup.py`: Python package setup script.
-- `setup.cfg`: Configuration for packaging.
-- `package.xml`: ROS 2 package manifest.
 
 ## Installation
 
-1. **Clone the repository** (if not already in your workspace):
+### Prerequisites
+
+Before installing this package, ensure you have the following dependencies installed:
+
+1. **ROS 2 Humble**
+   - Follow the official installation guide: [https://docs.ros.org/en/humble/index.html](https://docs.ros.org/en/humble/index.html)
+
+2. **libfranka v0.13.2**
+   - Install from source: [https://github.com/frankaemika/libfranka](https://github.com/frankaemika/libfranka)
+   - Make sure to check out version v0.13.2:
+     ```bash
+     git clone https://github.com/frankaemika/libfranka.git
+     cd libfranka
+     git checkout 0.13.2
+     # Follow build instructions from the repository
+     ```
+
+3. **franka_ros2 v0.1.15**
+   - Install from source: [https://github.com/frankaemika/franka_ros2](https://github.com/frankaemika/franka_ros2)
+   - Make sure to check out version v0.1.15:
+     ```bash
+     git clone https://github.com/frankaemika/franka_ros2.git
+     cd franka_ros2
+     git checkout 0.1.15
+     # Build and install according to the repository instructions
+     ```
+
+### Installation Steps
+
+1. **Clone the repository**
    ```bash
    cd ~/franka_ros2_ws/src
    git clone <this-repo-url>

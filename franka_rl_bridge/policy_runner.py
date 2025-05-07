@@ -396,20 +396,23 @@ class PolicyRunner(Node):
                         self.open_gripper()
                         return
                     elif desired_gripper_state == 'closed':
-                        # Store current joint positions for holding
+                        # Store the desired positions from policy instead of current positions
                         self.hold_position = interpreted_actions
-                        # Convert self.joint_positions to format that matches the policy output
-                        self.hold_position["joint_positions"] = 2*(self.joint_positions[:7])
-                        self.get_logger().info(f"Holding position: {self.hold_position}")
+                        
+                        self.get_logger().info(f"Holding at policy-desired position: {self.hold_position}")
                         # Enter hold mode
                         self.hold_position_active = True
                         self.stop()  # Pause policy execution
                         # Send the grasp command
                         self.close_gripper()
                         self.execute_action(self.hold_position)
-                        self.last_action[0, :-1] = torch.tensor(self.joint_positions, device=self.policy_loader.device).unsqueeze(0)
+                        
+                        # Store the policy-provided action as last_action rather than current positions
+                        self.last_action = action.detach().clone()
+                        # Only override the gripper command part
                         self.last_action[0, -1] = -4.5
-                        self.get_logger().info(f"Holding position: {self.hold_position}")
+                        
+                        self.get_logger().info(f"Holding at policy-desired position: {self.hold_position}")
                         return
                 
                 # If gripper action hasn't changed simply execute the action

@@ -71,6 +71,7 @@ class PolicyLoader:
         else:
             raise ValueError("Could not find 'model_state_dict' in the checkpoint")
 
+    
     def create_policy_model(self):
         """Create an instance of the policy model with the right architecture.
         RSL-RL algorithm uses Actor-Critic architecture for the policy model."""
@@ -104,7 +105,8 @@ class PolicyLoader:
                 # Standard deviation parameter
                 self.register_buffer('std', torch.ones(output_dim))
 
-            # Forward pass for the model, x is the input tensor of shape (40,1) # Updated comment
+            # Has to be updated when observation space changes
+            # Forward pass for the model, x is the input tensor of shape (40,1)
             # This is the function that gets called when we do action = policy(obs)
             def forward(self, x):
                 # If input is a dict, convert to tensor
@@ -162,7 +164,8 @@ class PolicyLoader:
         object_orientation_tensor = torch.tensor(object_orientation, dtype=torch.float32, device=self.device).unsqueeze(0)
         target_pos_tensor = torch.tensor(target_pos, dtype=torch.float32, device=self.device).unsqueeze(0)
         
-        # Create observation dictionary (for policies that expect dictionary input)
+        # Create observation dictionary
+        # When 
         obs_dict = {
             "joint_pos": joint_pos_tensor,
             "joint_vel": joint_vel_tensor,

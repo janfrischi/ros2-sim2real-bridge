@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Live plotter for policy outputs from the /policy_outputs topic.
-Displays joint positions and gripper command in real-time.
+Displays joint positions, gripper command, and position errors in real-time.
 """
 
 import rclpy
@@ -35,6 +35,13 @@ class PolicyOutputPlotter(Node):
             self.listener_callback,
             10)
         
+        # Create subscription to current joint states (observations)
+        self.observation_subscription = self.create_subscription(
+            Float64MultiArray,
+            '/rl/observations',
+            self.observation_callback,
+            10)
+        
         # Add subscription to monitor policy status
         self.status_subscription = self.create_subscription(
             String,
@@ -42,18 +49,24 @@ class PolicyOutputPlotter(Node):
             self.status_callback,
             10)
         
-        self.get_logger().info('Subscribed to /policy_outputs and /policy_status topics')
+        self.get_logger().info('Subscribed to /policy_outputs, /rl/observations and /policy_status topics')
         
         # Data storage - use lists instead of deques to keep all data if needed
         if show_all_data:
             # Use regular lists for storing all data
             self.times = []
             self.data_buffers = [[] for _ in range(8)]
+            self.error_times = []
+            self.error_buffers = [[] for _ in range(7)]  # Store position errors for 7 joints
+            self.current_positions = [[] for _ in range(7)]  # Store current joint positions
         else:
             # Use deques with fixed size for rolling window
             self.buffer_size = buffer_size
             self.times = deque(maxlen=buffer_size)
             self.data_buffers = [deque(maxlen=buffer_size) for _ in range(8)]
+            self.error_times = deque(maxlen=buffer_size)
+            self.error_buffers = [deque(maxlen=buffer_size) for _ in range(7)]
+            self.current_positions = [deque(maxlen=buffer_size) for _ in range(7)]
         
         self.joint_names = [f'Joint {i+1}' for i in range(7)] + ['Gripper']
         self.colors = ['blue', 'green', 'red', 'cyan', 'magenta', 'yellow', 'black', 'orange']
@@ -62,14 +75,20 @@ class PolicyOutputPlotter(Node):
         self.start_time = None
         self.last_timestamp = 0
         
+        # Track latest policy outputs and observations for error calculation
+        self.latest_policy_outputs = [0.0] * 7
+        self.latest_observations = [0.0] * 7
+        self.latest_policy_timestamp = 0.0
+        self.latest_observation_timestamp = 0.0
+        
         # Track policy pause events
         self.pause_events = []  # List of (timestamp, is_paused) tuples
         self.is_policy_paused = False
         self.pause_patches = []  # To store the pause indicator rectangles
         
         # Setup the plot
-        self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(10, 8))
-        self.fig.suptitle('Policy Outputs Live Plot')
+        self.fig, (self.ax1, self.ax2, self.ax3) = plt.subplots(3, 1, figsize=(10, 12))
+        self.fig.suptitle('Policy Outputs and Position Errors Live Plot')
         
         # Initialize lines for joint positions (top plot)
         self.joint_lines = []
@@ -82,7 +101,7 @@ class PolicyOutputPlotter(Node):
         self.ax1.legend(loc='upper right')
         self.ax1.grid(True)
         
-        # Initialize line for gripper command (bottom plot)
+        # Initialize line for gripper command (middle plot)
         self.gripper_line, = self.ax2.plot([], [], label=self.joint_names[7], color=self.colors[7], linewidth=2)
         
         # Add horizontal lines for gripper command thresholds
@@ -90,10 +109,21 @@ class PolicyOutputPlotter(Node):
         self.ax2.axhline(y=1.0, color='g', linestyle='--', alpha=0.7, label='Open threshold')
         
         self.ax2.set_ylabel('Gripper Command')
-        self.ax2.set_xlabel('Time (seconds)')
         self.ax2.set_title('Gripper Command')
         self.ax2.legend(loc='upper right')
         self.ax2.grid(True)
+        
+        # Initialize lines for position errors (bottom plot)
+        self.error_lines = []
+        for i in range(7):
+            line, = self.ax3.plot([], [], label=f"Error {self.joint_names[i]}", color=self.colors[i])
+            self.error_lines.append(line)
+        
+        self.ax3.set_ylabel('Position Error (rad)')
+        self.ax3.set_xlabel('Time (seconds)')
+        self.ax3.set_title('Joint Position Errors')
+        self.ax3.legend(loc='upper right')
+        self.ax3.grid(True)
         
         # Add view mode indicator
         view_mode_text = f"View Mode: {'Complete History' if show_all_data else f'Last {window_size}s'}"
@@ -146,6 +176,59 @@ class PolicyOutputPlotter(Node):
         # Store each value in its corresponding buffer
         for i, value in enumerate(data):
             self.data_buffers[i].append(value)
+            
+        # Store latest policy outputs for error calculation
+        for i in range(7):  # Only store joint positions, not gripper command
+            self.latest_policy_outputs[i] = data[i]
+        self.latest_policy_timestamp = timestamp
+        
+        # Calculate and store position errors if we have both policy outputs and observations
+        self.calculate_errors(timestamp)
+
+    def observation_callback(self, msg):
+        """Process incoming observation messages (current joint states)."""
+        if self.start_time is None:
+            return  # Can't process without start time initialized
+            
+        current_time = self.get_clock().now().nanoseconds / 1e9
+        timestamp = current_time - self.start_time
+        
+        # Extract joint positions from observations (first 7 values)
+        data = msg.data
+        if len(data) < 7:
+            self.get_logger().warning(f'Unexpected observation data length: {len(data)}, expected at least 7')
+            return
+            
+        # Store current positions
+        for i in range(7):
+            self.latest_observations[i] = data[i]
+            self.current_positions[i].append(data[i])
+            
+        self.latest_observation_timestamp = timestamp
+        
+        # Calculate and store position errors if we have both policy outputs and observations
+        self.calculate_errors(timestamp)
+    
+    def calculate_errors(self, timestamp):
+        """Calculate position errors if both policy outputs and observations are available."""
+        # Skip if either timestamp is zero (not initialized)
+        if self.latest_policy_timestamp == 0.0 or self.latest_observation_timestamp == 0.0:
+            return
+            
+        # Calculate time difference between policy and observation
+        time_diff = abs(self.latest_policy_timestamp - self.latest_observation_timestamp)
+        
+        # Only calculate errors if timestamps are close enough (within 0.1 seconds)
+        if time_diff > 0.1:
+            return
+            
+        # Store error timestamp
+        self.error_times.append(timestamp)
+        
+        # Calculate and store position errors for each joint
+        for i in range(7):
+            error = self.latest_policy_outputs[i] - self.latest_observations[i]
+            self.error_buffers[i].append(error)
     
     def status_callback(self, msg):
         """Process policy status messages."""
@@ -175,14 +258,25 @@ class PolicyOutputPlotter(Node):
         # Convert data structures to lists for plotting (if using deques)
         if not isinstance(self.times, list):
             times_list = list(self.times)
+            error_times_list = list(self.error_times) if self.error_times else []
         else:
             times_list = self.times
+            error_times_list = self.error_times
         
         # Ensure all data arrays have the same length as times_list
         min_length = min(len(times_list), *[len(buffer) for buffer in self.data_buffers])
         
         if min_length < len(times_list):
             times_list = times_list[:min_length]
+        
+        # Calculate min error length if we have error data
+        if error_times_list:
+            min_error_length = min(len(error_times_list), 
+                                  *[len(buffer) for buffer in self.error_buffers if buffer])
+            if min_error_length < len(error_times_list):
+                error_times_list = error_times_list[:min_error_length]
+        else:
+            min_error_length = 0
         
         # Update joint position lines
         for i in range(7):
@@ -197,6 +291,13 @@ class PolicyOutputPlotter(Node):
         gripper_data = gripper_data[:min_length]
         self.gripper_line.set_data(times_list, gripper_data)
         
+        # Update position error lines
+        for i in range(7):
+            if min_error_length > 0:
+                error_data = list(self.error_buffers[i]) if not isinstance(self.error_buffers[i], list) else self.error_buffers[i]
+                error_data = error_data[:min_error_length]
+                self.error_lines[i].set_data(error_times_list, error_data)
+        
         # Update x-axis limits based on view mode
         if self.show_all_data:
             # Show all data from beginning
@@ -209,6 +310,7 @@ class PolicyOutputPlotter(Node):
         
         self.ax1.set_xlim(x_min, x_max)
         self.ax2.set_xlim(x_min, x_max)
+        self.ax3.set_xlim(x_min, x_max)
         
         # Auto-scale y-axes
         if len(times_list) > 1:
@@ -242,6 +344,26 @@ class PolicyOutputPlotter(Node):
             gripper_min = min(visible_gripper_data) - 0.5 if visible_gripper_data else -3
             gripper_max = max(visible_gripper_data) + 0.5 if visible_gripper_data else 3
             
+            # For error data
+            error_data = []
+            if min_error_length > 0:
+                for i in range(7):
+                    if isinstance(self.error_buffers[i], list):
+                        if not self.show_all_data:
+                            visible_error_data = self.error_buffers[i][:min_error_length]
+                        else:
+                            visible_indices = [j for j, t in enumerate(error_times_list) if t >= x_min and t <= x_max]
+                            visible_error_data = [self.error_buffers[i][j] for j in visible_indices if j < len(self.error_buffers[i])]
+                        error_data.append(visible_error_data)
+                    else:
+                        error_data.append(list(self.error_buffers[i])[:min_error_length])
+                
+                # Calculate min/max for visible error data
+                if any(data for data in error_data):
+                    error_min = min(min(data) if data else 0 for data in error_data) - 0.05
+                    error_max = max(max(data) if data else 0 for data in error_data) + 0.05
+                    self.ax3.set_ylim(max(-0.5, error_min), min(0.5, error_max))  # Limit to reasonable range
+            
             self.ax1.set_ylim(joint_min, joint_max)
             self.ax2.set_ylim(min(-3, gripper_min), max(3, gripper_max))  # Ensure we show the threshold lines
         
@@ -259,10 +381,11 @@ class PolicyOutputPlotter(Node):
                 elif pause_start is not None:
                     # Draw shaded region from pause_start to timestamp
                     if pause_start >= x_min and timestamp <= x_max:
-                        # Add shaded region to both plots
+                        # Add shaded region to all plots
                         rect1 = self.ax1.axvspan(pause_start, timestamp, alpha=0.2, color='red', label='Policy Paused')
                         rect2 = self.ax2.axvspan(pause_start, timestamp, alpha=0.2, color='red')
-                        self.pause_patches.extend([rect1, rect2])
+                        rect3 = self.ax3.axvspan(pause_start, timestamp, alpha=0.2, color='red')
+                        self.pause_patches.extend([rect1, rect2, rect3])
                     pause_start = None
             
             # If currently paused, draw from last pause to current time
@@ -270,13 +393,14 @@ class PolicyOutputPlotter(Node):
                 if pause_start >= x_min and self.last_timestamp <= x_max:
                     rect1 = self.ax1.axvspan(pause_start, self.last_timestamp, alpha=0.2, color='red', label='Policy Paused')
                     rect2 = self.ax2.axvspan(pause_start, self.last_timestamp, alpha=0.2, color='red')
-                    self.pause_patches.extend([rect1, rect2])
+                    rect3 = self.ax3.axvspan(pause_start, self.last_timestamp, alpha=0.2, color='red')
+                    self.pause_patches.extend([rect1, rect2, rect3])
         
         # Update timestamp text
         self.timestamp_text.set_text(f'Time: {self.last_timestamp:.2f}s')
         
         # Return all artists that were updated
-        artists = self.joint_lines + [self.gripper_line, self.timestamp_text]
+        artists = self.joint_lines + [self.gripper_line, self.timestamp_text] + self.error_lines
         return artists
     
     def on_key_press(self, event):
@@ -287,10 +411,6 @@ class PolicyOutputPlotter(Node):
             view_mode_text = f"View Mode: {'Complete History' if self.show_all_data else f'Last {self.window_size}s'}"
             self.view_mode_text.set_text(view_mode_text)
             self.get_logger().info(f"View mode changed to: {view_mode_text}")
-            
-            # If switching to fixed window and using lists, we'll keep using lists but just change the display
-            # If switching to complete history and using deques, we'd need to convert - but this is complex
-            # So we'll just keep whatever data structure we started with
             
             # Force update
             self.fig.canvas.draw_idle()
@@ -303,7 +423,7 @@ class PolicyOutputPlotter(Node):
 
 
 def main(args=None):
-    parser = argparse.ArgumentParser(description='Live plotting of policy outputs')
+    parser = argparse.ArgumentParser(description='Live plotting of policy outputs and position errors')
     parser.add_argument('--buffer', type=int, default=3000, help='Buffer size for plotting (default: 3000)')
     parser.add_argument('--interval', type=int, default=100, help='Plot update interval in milliseconds (default: 100)')
     parser.add_argument('--window', type=int, default=30, help='Window size in seconds for rolling view (default: 30)')

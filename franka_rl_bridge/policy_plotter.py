@@ -9,7 +9,6 @@ from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
 from std_msgs.msg import String
 import matplotlib.pyplot as plt
-import numpy as np
 from matplotlib.animation import FuncAnimation
 from collections import deque
 import argparse

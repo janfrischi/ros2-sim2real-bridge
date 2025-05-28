@@ -12,7 +12,7 @@ This node listens to the /joint_states topic and the gripper state topic, then p
 the joint positions and velocities as a flat array to the /rl/observations topic.
 The flat array serves as the observation for the reinforcement learning agent.
 The first 7 entries are joint positions, the next 2 entries are gripper positions,
-followed by 7 joint velocities and 2 gripper velocities, and finally the end-effector position (x, y, z).
+followed by 7 joint velocities and 2 gripper velocities, and finally the end-effector position (x, y, z) and quaternion (x, y, z, w).
 """
 class JointStateListener(Node):
     def __init__(self):
@@ -28,6 +28,7 @@ class JointStateListener(Node):
         self.gripper_positions = [0.0, 0.0]  # Default to closed position
         self.gripper_velocities = [0.0, 0.0]  # Default to no velocity
         self.end_effector_position = [0.0, 0.0, 0.0]  # Initialize EE position
+        self.end_effector_quaternion = [0.0, 0.0, 0.0, 1.0]  # Initialize EE quaternion
         self.joint_names = []
         self.gripper_names = []
         self.joint_state_received = False
@@ -114,7 +115,11 @@ class JointStateListener(Node):
         # Extract O_T_EE (End-Effector Pose in Base Frame)
         ee_pose = msg.o_t_ee  # This is a PoseStamped message
         position = ee_pose.pose.position
+        orientation = ee_pose.pose.orientation
+
+        # Extract position and quaternion
         self.end_effector_position = [position.x, position.y, position.z]
+        self.end_effector_quaternion = [orientation.x, orientation.y, orientation.z, orientation.w]
         self.franka_state_received = True
 
         # Publish observation
@@ -124,11 +129,11 @@ class JointStateListener(Node):
     def publish_observation(self):
         # Only publish if we've received both joint data and Franka state data
         if self.joint_state_received and self.franka_state_received:
-            # Combine position and velocity into one flat array:
-            # [joint_pos(7), gripper_pos(2), joint_vel(7), gripper_vel(2), ee_pos(3)] -> Total 21
+            # Combine position, velocity, and quaternion into one flat array:
+            # [joint_pos(7), gripper_pos(2), joint_vel(7), gripper_vel(2), ee_pos(3), ee_quat(4)] -> Total 25
             obs_vector = (self.joint_positions + self.gripper_positions +
                           self.joint_velocities + self.gripper_velocities +
-                          self.end_effector_position)
+                          self.end_effector_position + self.end_effector_quaternion)
             
             # Create and publish message
             obs_msg = Float64MultiArray()
@@ -172,6 +177,10 @@ class JointStateListener(Node):
                 # Print EE position
                 self.get_logger().info('End-Effector Position (x, y, z):')
                 self.get_logger().info(f'  {self.end_effector_position[0]:.6f}, {self.end_effector_position[1]:.6f}, {self.end_effector_position[2]:.6f}')
+                
+                # Print EE quaternion
+                self.get_logger().info('End-Effector Quaternion (x, y, z, w):')
+                self.get_logger().info(f'  {self.end_effector_quaternion[0]:.6f}, {self.end_effector_quaternion[1]:.6f}, {self.end_effector_quaternion[2]:.6f}, {self.end_effector_quaternion[3]:.6f}')
                 
                 self.get_logger().info('---------------------------------')
 

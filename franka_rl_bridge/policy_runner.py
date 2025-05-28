@@ -21,7 +21,6 @@ import torch
 from rclpy.action import ActionClient
 from franka_msgs.action import Homing, Move, Grasp
 from action_msgs.msg import GoalStatus
-from rclpy.duration import Duration
 from franka_rl_bridge.policy_inference import PolicyLoader
 from geometry_msgs.msg import PoseStamped
 
@@ -61,7 +60,7 @@ class PolicyRunner(Node):
         self.target_position = np.array([0.5, 0.0, 0.5, 0.0, 1.0, 0.0, 0.0])  # x,y,z,qw,qx,qy,qz
         
         # Define object position 
-        self.object_position = np.array([0.4, -0.2, 0.03])  # x,y,z on table
+        self.object_position = np.array([0.5, 0.3, 0.055])  # x,y,z on table
         self.object_orientation = np.array([1.0, 0.0, 0.0, 0.0]) # Default orientation (identity quaternion)
         self.object_grasped = False # Flag to indicate if the object is currently grasped
         self.object_position_received = False  # Flag to track if we've received object data from perception
@@ -80,6 +79,7 @@ class PolicyRunner(Node):
         self.hold_position_active = False
         self.hold_position_end_time = None
         self.hold_position = None
+        self.perception_data_received = False
 
         #---Subscription and Publisher Initialization---
         
@@ -335,9 +335,10 @@ class PolicyRunner(Node):
         """Run the loaded policy on current observations"""
         
         # Check if we've received object position data from perception
-        if not self.object_position_received and self.print_counter % self.print_frequency == 0:
+        if not self.object_position_received and not self.perception_data_received:
             self.get_logger().warning("No object position data received from perception! Using default values: "
                                       f"position={self.object_position}, orientation={self.object_orientation}")
+            self.perception_data_received = True  # Set to True to avoid repeated warnings
         
         # Create observation for policy 
         obs = self.policy_loader.create_observation(
@@ -363,7 +364,7 @@ class PolicyRunner(Node):
                 # Run inference on the observations
                 action = self.policy_loader.run_inference(obs)
                 if self.object_grasped:
-                    action[0, -1] = -4.5
+                    action[0, -1] = -18  # Set gripper command to -18 if object is grasped
                 # Extract joint positions and gripper command from the action
                 interpreted_actions = self.policy_loader.interpret_action(action)
                 
@@ -386,7 +387,7 @@ class PolicyRunner(Node):
 
                 # Handle gripper command
                 gripper_command = action[0, -1]
-                desired_gripper_state = 'closed' if gripper_command <= -1 else 'open'
+                desired_gripper_state = 'closed' if gripper_command <= -10 else 'open'
                 
                 # Execute gripper action if the state has changed
                 if desired_gripper_state != self.gripper_goal_state:
@@ -410,7 +411,7 @@ class PolicyRunner(Node):
                         # Store the policy-provided action as last_action rather than current positions
                         self.last_action = action.detach().clone()
                         # Only override the gripper command part
-                        self.last_action[0, -1] = -4.5
+                        self.last_action[0, -1] = -18
                         
                         self.get_logger().info(f"Holding at policy-desired position: {self.hold_position}")
                         return
@@ -422,8 +423,8 @@ class PolicyRunner(Node):
                
             # CASE 2: Policy is in hold position mode (during gripper closure)
             elif self.hold_position_active:
-                self.hold_position["gripper_command"] = -4.5
-                self.last_action[0, -1] = -4.5  # Update last action to reflect gripper command
+                self.hold_position["gripper_command"] = -18
+                self.last_action[0, -1] = -18  # Update last action to reflect gripper command
 
                 # Publish the hold position message
                 self.execute_action(self.hold_position)  
@@ -527,7 +528,7 @@ class PolicyRunner(Node):
         processed_policy_outputs_msg = Float64MultiArray()
         processed_data = [float(pos) for pos in home_position]
         # Append an open gripper command
-        processed_data.append(4.0) 
+        processed_data.append(5.0) 
         processed_policy_outputs_msg.data = processed_data
 
         self.policy_outputs_publisher.publish(processed_policy_outputs_msg)

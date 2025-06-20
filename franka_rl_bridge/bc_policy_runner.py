@@ -25,8 +25,6 @@ from franka_msgs.action import Homing, Move, Grasp
 from action_msgs.msg import GoalStatus
 import tf2_ros
 
-from scipy.spatial.transform import Rotation as R
-
 # Define the LSTMGMMNetwork class
 class LSTMGMMNetwork(nn.Module):
     """LSTM + GMM Actor Network for Behavior Cloning - IsaacLab Compatible"""
@@ -34,18 +32,18 @@ class LSTMGMMNetwork(nn.Module):
     def __init__(self, obs_dim: int = 48, action_dim: int = 8, hidden_dim: int = 400, 
                  num_layers: int = 2, num_modes: int = 5, min_std: float = 0.0001,
                  std_activation: str = "softplus", low_noise_eval: bool = True):
-        super().__init__() # Inherit from nn.Module
-        
+        super().__init__()  # Inherit from nn.Module
+
         self.obs_dim = obs_dim # Dimension of the observation space
         self.action_dim = action_dim # Dimension of the action space "Absolute end-effector pose + gripper command"
         self.hidden_dim = hidden_dim # Dimension of LSTM hidden state
         self.num_layers = num_layers # Number of LSTM layers
         self.num_modes = num_modes # Number of Gaussians in GMM (same as num_nodes in IsaacLab)
-        self.min_std = min_std
-        self.std_activation = std_activation
-        self.low_noise_eval = low_noise_eval
+        self.min_std = min_std # Minimum standard deviation for Gaussian scale parameters
+        self.std_activation = std_activation # Activation function for standard deviation
+        self.low_noise_eval = low_noise_eval # Flag for low noise evaluation
         
-        # LSTM layer - match the checkpoint structure exactly
+        # Architecture for LSTM Network
         self.lstm = nn.LSTM(
             input_size=obs_dim,
             hidden_size=hidden_dim,
@@ -54,7 +52,7 @@ class LSTMGMMNetwork(nn.Module):
             bidirectional=False  # Explicitly set from config
         )
 
-        # Per-step network GMM heads (ACTIVE during inference)
+        # Architecture for Gaussian Mixture Model (GMM) heads
         self.gmm = nn.ModuleDict({
             'mean': nn.Linear(hidden_dim, num_modes * action_dim),  
             'scale': nn.Linear(hidden_dim, num_modes * action_dim),
@@ -98,16 +96,17 @@ class LSTMGMMNetwork(nn.Module):
         if self.hidden_states is None:
             self.reset_hidden_states(batch_size)
             
-        # LSTM forward pass
+        # LSTM forward pass -> Returns two values
+        # lstm_out: [batch_size, seq_length, hidden_dim]
+        # self.hidden_states: tuple of (h_n, c_n) with shape [num_layers, batch_size, hidden_dim]
         lstm_out, self.hidden_states = self.lstm(obs_tensor, self.hidden_states)
         
         # Take the last timestep output (h_t) hidden state vector
         h_t = lstm_out[:, -1, :]  # [batch_size, hidden_dim]
-
-        # Use gmm heads for inference
-        # These process the hidden state h_t at each timestep
+        
+        # Pass h_t through GMM heads to get means, scales, and logits of the Gaussian Mixture Model
         means = self.gmm['mean'](h_t).view(batch_size, self.num_modes, self.action_dim)  # Reshape to [batch_size, num_modes, action_dim]
-        scales = torch.nn.functional.softplus(self.gmm['scale'](h_t)).view(batch_size, self.num_modes, self.action_dim)  # Reshape to [batch_size, num_modes, action_dim]
+        scales = nn.functional.softplus(self.gmm['scale'](h_t)).view(batch_size, self.num_modes, self.action_dim)  # Reshape to [batch_size, num_modes, action_dim]
         scales = torch.clamp(scales, min=self.min_std)
         logits = self.gmm['logits'](h_t)  # [batch_size, num_modes]
 
@@ -115,16 +114,15 @@ class LSTMGMMNetwork(nn.Module):
         if self.low_noise_eval and not self.training:
             scales = scales * 0.1  # Reduce noise during evaluation
 
-        
         # Handle deterministic vs stochastic action selection from the Gaussian Mixture model
         if deterministic:
             # Return mean of most likely mode
-            # Determine the mode probalities and select the best mode
             mode_probs = torch.softmax(logits, dim=-1) # Run softmax on logits to get probabilities
             best_mode = torch.argmax(mode_probs, dim=-1)
             # Get the means for the best mode, actions contains the 8d mean vector of the most probable Gaussian mode
             actions = means[torch.arange(batch_size), best_mode]
             return actions
+        
         else:
             # Stochastic Sampling from GMM
 
@@ -136,13 +134,14 @@ class LSTMGMMNetwork(nn.Module):
             # Step 2. Sample actions from the selected Gaussian
             selected_means = means[torch.arange(batch_size), selected_modes]
             selected_scales = scales[torch.arange(batch_size), selected_modes]
-            # Create the Gaussian Distribution
+
+            # Step 3. Create the Gaussian Distribution
             gaussian_dist = torch.distributions.Normal(selected_means, selected_scales)
-            # Sample actions from the Gaussian distribution
+            # Step 4. Sample actions from the Gaussian distribution
             actions = gaussian_dist.sample()
             return actions
 
-
+# BCPolicy Runner Node
 class BCPolicyRunner(Node):
     """ROS2 Node for running Behavior Cloning policy on Franka robot"""
     # We use 20Hz control frequency as this was the default in the original IsaacLab implementation
@@ -251,15 +250,6 @@ class BCPolicyRunner(Node):
             qos_profile
         )
         
-        # Remove gripper_command_pub since we'll use action clients directly
-        
-        # Add observation publisher for debugging
-        self.observation_pub = self.create_publisher(
-            Float64MultiArray,
-            '/bc_policy/observations',
-            qos_profile
-        )
-        
         # TF2 setup
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
@@ -274,6 +264,7 @@ class BCPolicyRunner(Node):
         # Keyboard input timer (check for keypress every 50ms)
         self.keyboard_timer = self.create_timer(0.05, self.check_keyboard_input)
         
+        # Print initial instructions
         self.print_instructions()
 
     # Helper to wait for action servers (from policy_runner.py)
@@ -287,7 +278,7 @@ class BCPolicyRunner(Node):
              self.get_logger().error(f'ROS shutdown while waiting for {name} server.')
              raise SystemExit('ROS shutdown')
 
-    # Method to home the gripper (from policy_runner.py)
+    # Method to home the gripper 
     def home_gripper(self):
         goal_msg = Homing.Goal()
         # Send goal async and forget (or handle future if needed)
@@ -351,18 +342,11 @@ class BCPolicyRunner(Node):
     
     def gripper_state_callback(self, msg: JointState):
         """Callback for gripper state updates"""
-        if len(msg.position) >= 2:
-            # Gripper should have symmetric but opposite values: [+value, -value]
-            finger_1_pos = msg.position[0]  # First finger (positive)
-            finger_2_pos = -msg.position[1] if msg.position[1] > 0 else msg.position[1]  # Second finger (negative)
-            
-            self.current_gripper_positions = np.array([finger_1_pos, finger_2_pos])
-        else:
-            # Fallback: create symmetric gripper positions
-            if len(msg.position) >= 1:
-                pos = msg.position[0]
-                self.current_gripper_positions = np.array([pos, -pos])
-    
+        # Gripper should have symmetric but opposite values: [+value, -value]
+        finger_1_pos = msg.position[0]  # First finger (positive)
+        finger_2_pos = -msg.position[1] if msg.position[1] > 0 else msg.position[1]  # Second finger (negative)
+        self.current_gripper_positions = np.array([finger_1_pos, finger_2_pos])
+
     def print_instructions(self):
         """Print keyboard control instructions"""
         # Clear screen and print instructions with proper formatting
@@ -408,7 +392,79 @@ class BCPolicyRunner(Node):
         print("Status: STOPPED - Press SPACE to start".center(80))
         print("=" * 80)
         print()  # Add blank line
+
+    def load_policy(self, policy_path: str) -> LSTMGMMNetwork:
+        """Load the trained BC policy from checkpoint"""
+        try:
+            # Load the checkpoint file
+            checkpoint = torch.load(policy_path, map_location=self.device)
+            # Extract the model weights dictionary
+            state_dict = checkpoint['model']
         
+            # Create network with config-compatible parameters
+            policy = LSTMGMMNetwork(
+                obs_dim=48,
+                action_dim=8,
+                hidden_dim=400,
+                num_layers=2,
+                num_modes=5,
+                min_std=0.0001,
+                std_activation="softplus",
+                low_noise_eval=True
+            ).to(self.device)
+            
+            # Create a mapping for the weights (only load the ACTIVE components)
+            policy_state_dict = {}
+            for key, value in state_dict.items():
+                # LSTM Components 
+                if key.startswith('policy.nets.rnn.nets.'):
+                    # Map RNN weights: policy.nets.rnn.nets.* -> lstm.*
+                    new_key = key.replace('policy.nets.rnn.nets.', 'lstm.')
+                    policy_state_dict[new_key] = value
+                # Per-Step GMM Components
+                elif key.startswith('policy.nets.rnn.per_step_net.nets.'):
+                    # Map per-step weights (ACTIVE PATH): policy.nets.rnn.per_step_net.nets.* -> gmm.*
+                    new_key = key.replace('policy.nets.rnn.per_step_net.nets.', 'gmm.')
+                    policy_state_dict[new_key] = value
+                
+            # Load weights into the model
+            policy.load_state_dict(policy_state_dict, strict=True)
+            
+            # Reset LSTM hidden states for new_episode
+            policy.reset_hidden_states(batch_size=1)
+            
+            print("Successfully loaded IsaacLab BC policy")
+            print(f"Loaded {len(policy_state_dict)} weight tensors")
+
+            # Log the structure of self.lstm and self.gmm
+            print("=" * 60)
+            print("MODEL STRUCTURE LOGGING")
+            print("=" * 60)
+
+            print("\n🔍 LSTM Module Structure:")
+            print("-" * 40)
+            for name, param in policy.lstm.named_parameters():
+                print(f"Key: {name}")
+                print(f"Shape: {param.shape}")
+                print("-" * 20)
+
+            print("\n🔍 GMM Module Structure:")
+            print("-" * 40)
+            for name, param in policy.gmm.named_parameters():
+                print(f"Key: {name}")
+                print(f"Shape: {param.shape}")
+                print("-" * 20)
+
+            print("=" * 60)
+            print("END MODEL STRUCTURE LOGGING")
+            print("=" * 60)
+            
+            return policy
+            
+        except Exception as e:
+            self.get_logger().error(f"Error loading policy: {e}")
+            raise
+
     def compute_object_observations(self) -> np.ndarray:
         """
         Compute 39D object observations matching IsaacLab structure:
@@ -467,7 +523,6 @@ class BCPolicyRunner(Node):
         cube_2_pos_rel = cube_2_pos - self.env_origin
         cube_3_pos_rel = cube_3_pos - self.env_origin
 
-        # TODO: Check convention because of negative x
         # Compute gripper to cube vectors
         gripper_to_cube_1 = cube_1_pos - ee_pos
         gripper_to_cube_2 = cube_2_pos - ee_pos
@@ -495,77 +550,6 @@ class BCPolicyRunner(Node):
         ])
 
         return object_obs
-
-    def load_policy(self, policy_path: str) -> LSTMGMMNetwork:
-        """Load the trained BC policy from checkpoint"""
-        try:
-            # Load the checkpoint file
-            checkpoint = torch.load(policy_path, map_location=self.device)
-            # Extract the model weights dictionary
-            state_dict = checkpoint['model']
-        
-            # Create network with config-compatible parameters
-            policy = LSTMGMMNetwork(
-                obs_dim=48,
-                action_dim=8,
-                hidden_dim=400,
-                num_layers=2,
-                num_modes=5,
-                min_std=0.0001,
-                std_activation="softplus",
-                low_noise_eval=True
-            ).to(self.device)
-            
-            # Create a mapping for the weights (only load the ACTIVE components)
-            policy_state_dict = {}
-            for key, value in state_dict.items():
-                # LSTM Components 
-                if key.startswith('policy.nets.rnn.nets.'):
-                    # Map RNN weights: policy.nets.rnn.nets.* -> lstm.*
-                    new_key = key.replace('policy.nets.rnn.nets.', 'lstm.')
-                    policy_state_dict[new_key] = value
-                # Per-Step GMM Components
-                elif key.startswith('policy.nets.rnn.per_step_net.nets.'):
-                    # Map per-step weights (ACTIVE PATH): policy.nets.rnn.per_step_net.nets.* -> gmm.*
-                    new_key = key.replace('policy.nets.rnn.per_step_net.nets.', 'gmm.')
-                    policy_state_dict[new_key] = value
-                
-            # Load weights into the model
-            policy.load_state_dict(policy_state_dict, strict=True)
-            
-            policy.reset_hidden_states(batch_size=1)
-            
-            print("Successfully loaded IsaacLab BC policy")
-            print(f"Loaded {len(policy_state_dict)} weight tensors")
-
-            # Log the structure of self.lstm and self.gmm
-            print("=" * 60)
-            print("MODEL STRUCTURE LOGGING")
-            print("=" * 60)
-
-            print("\n🔍 LSTM Module Structure:")
-            print("-" * 40)
-            for name, param in policy.lstm.named_parameters():
-                print(f"Key: {name}")
-                print(f"Shape: {param.shape}")
-                print("-" * 20)
-
-            print("\n🔍 GMM Module Structure:")
-            print("-" * 40)
-            for name, param in policy.gmm.named_parameters():
-                print(f"Key: {name}")
-                print(f"Shape: {param.shape}")
-                print("-" * 20)
-
-            print("=" * 60)
-            print("END MODEL STRUCTURE LOGGING")
-            print("=" * 60)
-            
-            return policy
-            
-        except Exception as e:
-            self.get_logger().error(f"Error loading policy: {e}")
-            raise
 
     def update_status(self, status: str, additional_info: str = ""):
         """Update status display without interfering with other output"""
@@ -648,6 +632,7 @@ class BCPolicyRunner(Node):
             action = "S to stop" if self.is_running else "SPACE to start"
             self.update_status(f"Status: {status} - {action}, Z for zero mode, Q to quit")
     
+    # Create observation dictionary for the policy x_t -> Input to the policy
     def create_observation(self) -> Optional[Dict[str, torch.Tensor]]:
         """Create observation dictionary from current robot state"""
         # Extract end-effector position
@@ -701,7 +686,7 @@ class BCPolicyRunner(Node):
         return obs_dict
     
     def control_loop(self):
-        """Main control loop - runs at specified frequency"""
+        """Main control loop - runs at specified frequency - gets called by the timer"""
         if not self.is_running or not self.episode_active:
             return
             
@@ -710,16 +695,15 @@ class BCPolicyRunner(Node):
                 # Use zero observation directly
                 seq_obs_dict = self.create_zero_observation()
             else:
-                # Create current observation
+                # Create current observation x_t
                 obs_dict = self.create_observation()
-                if obs_dict is None:
-                    return
-                    
+                
                 # Add to sequence buffer
                 self.observation_buffer.append(obs_dict)
                 
                 # Maintain buffer length
                 if len(self.observation_buffer) > self.seq_length:
+                    # Remove oldest observation if buffer exceeds sequence length
                     self.observation_buffer.pop(0)
                 
                 # Pad buffer if needed (for start of episode)
@@ -746,11 +730,9 @@ class BCPolicyRunner(Node):
                 
             # Extract position and quaternion from pose
             position = eef_pose[:3]  # [x, y, z]
-            # Subtract 7cm from the z-coordinate to match IsaacLab's end-effector height
-            #position[2] -= 0.07  # Adjust z-coordinate to match Franka
             quaternion_sim = eef_pose[3:]  # [qw, qx, qy, qz] - IsaacLab format
             
-            # TRANSFORM: Convert from IsaacLab [qw, qx, qy, qz] to ROS [qx, qy, qz, qw]
+            # Convert from IsaacLab [qw, qx, qy, qz] to ROS [qx, qy, qz, qw]
             quaternion_ros = np.array([
                 quaternion_sim[1],  # qx
                 quaternion_sim[2],  # qy
@@ -773,7 +755,7 @@ class BCPolicyRunner(Node):
                 self.get_logger().info(f"Zero mode - Gripper: {gripper_command:.4f}", throttle_duration_sec=1.0)
                 return
             
-            # --- Gripper Control Logic (adapted from policy_runner.py) ---
+            # --- Gripper Control Logic ---
             desired_gripper_state = 'closed' if gripper_command < 0 else 'open'
             
             # Execute gripper action if the state has changed
@@ -786,10 +768,10 @@ class BCPolicyRunner(Node):
             # Create cartesian pose command: [x, y, z, qx, qy, qz, qw]
             cartesian_pose = np.concatenate([
                 position,         # [x, y, z]
-                quaternion_ros    # [qx, qy, qz, qw] - ROS format
+                quaternion_ros    # [qx, qy, qz, qw]
             ])
             
-            # Publish cartesian pose commands
+            # Publish cartesian pose commands to the controller
             pose_msg = Float64MultiArray()
             pose_msg.data = cartesian_pose.tolist()
             self.pose_command_pub.publish(pose_msg)

@@ -72,7 +72,7 @@ class LSTMGMMNetwork(nn.Module):
         )
     
     # Define the forward pass for the network
-    def forward(self, obs: Dict[str, torch.Tensor], deterministic: bool = True) -> torch.Tensor:
+    def forward(self, obs: Dict[str, torch.Tensor], deterministic: bool = False) -> torch.Tensor:
         """
         Forward pass through the network
         Args:
@@ -145,7 +145,7 @@ class LSTMGMMNetwork(nn.Module):
 class BCPolicyRunner(Node):
     """ROS2 Node for running Behavior Cloning policy on Franka robot"""
     # We use 20Hz control frequency as this was the default in the original IsaacLab implementation
-    def __init__(self, policy_path: str, device: str = "cpu", deterministic: bool = True, 
+    def __init__(self, policy_path: str, device: str = "cpu", deterministic: bool = False, 
                  control_frequency: float = 20.0):
         super().__init__('bc_policy_runner')
         
@@ -171,9 +171,9 @@ class BCPolicyRunner(Node):
         
         # Object state storage - hardcoded for now
         self.cube_positions = {
-            'cube_1': np.array([0.6, 0.2, 0.0203]),
-            'cube_2': np.array([0.4, 0.2, 0.0203]),
-            'cube_3': np.array([0.4, -0.2, 0.0203])
+            'cube_1': np.array([0.5, 0.2, 0.0203]),
+            'cube_2': np.array([0.4, 0.25, 0.0203]),
+            'cube_3': np.array([0.5, -0.2, 0.0203])
         }
         
         # Cube orientations (quaternions) - w, x, y, z format "IsaacLab expects quaternions in [w, x, y, z] format"
@@ -184,7 +184,7 @@ class BCPolicyRunner(Node):
         }
 
         # Environment origin (base frame reference)
-        self.env_origin = np.array([0.0, 0.0, 0.01879])  # Franka's home position in the world frame
+        self.env_origin = np.array([0.0, 0.0, 0.0])
 
         # Control flags
         self.is_running = False
@@ -200,7 +200,7 @@ class BCPolicyRunner(Node):
         # --- Gripper Control Initialization (from policy_runner.py) ---
         self.gripper_goal_state = 'unknown' # 'open', 'closed', 'unknown'
         self.gripper_max_width = 0.08 # Max width for Franka Hand
-        self.gripper_speed = 0.5 # Default speed (m/s)
+        self.gripper_speed = 0.05 # Default speed (m/s)
         self.gripper_force = 50.0 # Default grasp force (N)
         self.gripper_epsilon_inner = 0.05 # Tolerance for successful grasp
         self.gripper_epsilon_outer = 0.07
@@ -306,8 +306,6 @@ class BCPolicyRunner(Node):
         # Send the goal and register the callback for the result
         self.grasp_client.send_goal_async(goal_msg)
         self.gripper_goal_state = 'closed'
-
-    
         
     def eef_pose_callback(self, msg: PoseStamped):
         """Callback for end-effector pose updates"""
@@ -330,7 +328,6 @@ class BCPolicyRunner(Node):
         print("S:         Stop policy execution")
         print("R:         Reset to home position and clear episode state")
         print("Z:         Toggle Zero Vector Mode (48D zeros input)")
-        print("O:         Manual gripper toggle (Open/Close)")
         print("Q:         Quit the program")
         print("=" * 80)
         
@@ -562,10 +559,7 @@ class BCPolicyRunner(Node):
             elif key == 'z':  # Z - toggle zero vector mode
                 self.toggle_zero_vector_mode()
                 
-            elif key == 'o':  # O - manual gripper toggle
-                self.toggle_gripper_manual()
-                
-            elif key == 'q':  # Q - quit
+            elif key == 'q':  # Q - quit (remove ord(key) == 3 check)
                 self.shutdown_requested = True
                 print("Shutdown requested...")
                 raise KeyboardInterrupt("User requested shutdown")
@@ -575,25 +569,6 @@ class BCPolicyRunner(Node):
             raise
         except Exception as e:
             print(f"Keyboard input error: {e}")
-
-    def toggle_gripper_manual(self):
-        """Manually toggle gripper state between open and closed"""
-        try:
-            if self.gripper_goal_state == 'open' or self.gripper_goal_state == 'unknown':
-                # Close the gripper
-                self.close_gripper()
-                print("Manual gripper command: CLOSING")
-                self.update_status("Manual gripper: CLOSING", " - Press O again to open")
-                
-            elif self.gripper_goal_state == 'closed':
-                # Open the gripper
-                self.open_gripper()
-                print("Manual gripper command: OPENING")
-                self.update_status("Manual gripper: OPENING", " - Press O again to close")
-                
-        except Exception as e:
-            self.get_logger().error(f"Error in manual gripper control: {e}")
-            print(f"Manual gripper control failed: {e}")
 
     def start_policy(self):
         """Start policy execution"""
@@ -776,8 +751,6 @@ class BCPolicyRunner(Node):
     
             # Interpret action - 7D end-effector pose + 1D gripper
             eef_pose = action_np[:7]  # [x, y, z, qw, qx, qy, qz] - IsaacLab format
-            # Subtract constant offset from the z value of the end-effector pose
-            #eef_pose[2] -= 0.075  # Adjust z position to match IsaacLab's expected height
             gripper_command = action_np[7]  # Gripper command
                 
             # Extract position and quaternion from pose

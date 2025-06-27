@@ -53,9 +53,10 @@ class BCPolicyRunner(Node):
         self.policy, self.ckpt_dict = self.load_policy(policy_path)
         self.policy.start_episode()  # Initialize for new episode
         
-        # Robot state storage
-        self.current_eef_pose = None
-        self.current_gripper_positions = None
+        # Robot state storage - only needed for non-replay mode
+        if not self.replay_mode:
+            self.current_eef_pose = None
+            self.current_gripper_positions = None
 
         # Add sequence buffer for RNN - get sequence length from config if available
         self.seq_length = self.get_sequence_length_from_checkpoint()
@@ -64,22 +65,23 @@ class BCPolicyRunner(Node):
         # Zero vector test mode
         self.zero_vector_mode = False
         
-        # Object state storage - hardcoded for now
-        self.cube_positions = {
-            'cube_1': np.array([0.5, 0.2, 0.0203]),
-            'cube_2': np.array([0.3, 0.2, 0.0203]),
-            'cube_3': np.array([0.4, -0.2, 0.0203])
-        }
-        
-        # Cube orientations (quaternions) - w, x, y, z format "IsaacLab expects quaternions in [w, x, y, z] format"
-        self.cube_quaternions = {
-            'cube_1': np.array([0.0, 0.0, 0.0, 1.0]),  # Identity quaternion
-            'cube_2': np.array([0.0, 0.0, 0.0, 1.0]),  # Identity quaternion
-            'cube_3': np.array([0.0, 0.0, 0.0, 1.0])   # Identity quaternion
-        }
+        # Object state storage - hardcoded for now (only needed for non-replay mode)
+        if not self.replay_mode:
+            self.cube_positions = {
+                'cube_1': np.array([0.5, 0.2, 0.0203]),
+                'cube_2': np.array([0.3, 0.2, 0.0203]),
+                'cube_3': np.array([0.4, -0.2, 0.0203])
+            }
+            
+            # Cube orientations (quaternions) - w, x, y, z format "IsaacLab expects quaternions in [w, x, y, z] format"
+            self.cube_quaternions = {
+                'cube_1': np.array([0.0, 0.0, 0.0, 1.0]),  # Identity quaternion
+                'cube_2': np.array([0.0, 0.0, 0.0, 1.0]),  # Identity quaternion
+                'cube_3': np.array([0.0, 0.0, 0.0, 1.0])   # Identity quaternion
+            }
 
-        # Environment origin (base frame reference)
-        self.env_origin = np.array([0.0, 0.0, 0.0])  # Franka's home position in the world frame
+            # Environment origin (base frame reference)
+            self.env_origin = np.array([0.0, 0.0, 0.0])  # Franka's home position in the world frame
 
         # Control flags
         self.is_running = False
@@ -92,26 +94,27 @@ class BCPolicyRunner(Node):
         # Callback group for allowing concurrent callbacks
         self.callback_group = ReentrantCallbackGroup()
         
-        # --- Gripper Control Initialization ---
-        self.gripper_goal_state = 'unknown' # 'open', 'closed', 'unknown'
-        self.gripper_max_width = 0.08 # Max width for Franka Hand
-        self.gripper_speed = 0.5 # Default speed (m/s)
-        self.gripper_force = 50.0 # Default grasp force (N)
-        self.gripper_epsilon_inner = 0.05 # Tolerance for successful grasp
-        self.gripper_epsilon_outer = 0.07
-        
+        # --- Gripper Control Initialization - ONLY FOR NON-REPLAY MODE ---
+        if not self.replay_mode:
+            self.gripper_goal_state = 'unknown' # 'open', 'closed', 'unknown'
+            self.gripper_max_width = 0.08 # Max width for Franka Hand
+            self.gripper_speed = 0.5 # Default speed (m/s)
+            self.gripper_force = 50.0 # Default grasp force (N)
+            self.gripper_epsilon_inner = 0.05 # Tolerance for successful grasp
+            self.gripper_epsilon_outer = 0.07
+            
 
-        # Action clients for gripper, Homing, Move and Grasp are action definitions
-        self.homing_client = ActionClient(self, Homing, '/fr3_gripper/homing', callback_group=self.callback_group)
-        self.move_client = ActionClient(self, Move, '/fr3_gripper/move', callback_group=self.callback_group)
-        self.grasp_client = ActionClient(self, Grasp, '/fr3_gripper/grasp', callback_group=self.callback_group)
+            # Action clients for gripper, Homing, Move and Grasp are action definitions
+            self.homing_client = ActionClient(self, Homing, '/fr3_gripper/homing', callback_group=self.callback_group)
+            self.move_client = ActionClient(self, Move, '/fr3_gripper/move', callback_group=self.callback_group)
+            self.grasp_client = ActionClient(self, Grasp, '/fr3_gripper/grasp', callback_group=self.callback_group)
 
-        # Wait for gripper action servers
-        self.wait_for_action_server(self.homing_client, 'Homing')
-        self.wait_for_action_server(self.move_client, 'Move')
-        self.wait_for_action_server(self.grasp_client, 'Grasp')
-        # Perform initial homing
-        self.home_gripper()
+            # Wait for gripper action servers
+            self.wait_for_action_server(self.homing_client, 'Homing')
+            self.wait_for_action_server(self.move_client, 'Move')
+            self.wait_for_action_server(self.grasp_client, 'Grasp')
+            # Perform initial homing
+            self.home_gripper()
         # --- End Gripper Control Initialization ---
         
         # Setup QoS (Quality of Service) profiles
@@ -125,42 +128,45 @@ class BCPolicyRunner(Node):
         if self.replay_mode:
             self.load_replay_data()
         
-        # ------------------------------------------------------Subscribers--------------------------------------------------------------
-        self.eef_pose_sub = self.create_subscription(
-            PoseStamped,
-            '/franka_robot_state_broadcaster/current_pose',
-            self.eef_pose_callback,
-            qos_profile,
-            callback_group=self.callback_group
-        )
+        # ------------------------------------------------------Subscribers - ONLY FOR NON-REPLAY MODE--------------------------------------------------------------
+        if not self.replay_mode:
+            self.eef_pose_sub = self.create_subscription(
+                PoseStamped,
+                '/franka_robot_state_broadcaster/current_pose',
+                self.eef_pose_callback,
+                qos_profile,
+                callback_group=self.callback_group
+            )
+            
+            self.gripper_state_sub = self.create_subscription(
+                JointState,
+                '/fr3_gripper/joint_states',
+                self.gripper_state_callback,
+                qos_profile,
+                callback_group=self.callback_group
+            )
         
-        self.gripper_state_sub = self.create_subscription(
-            JointState,
-            '/fr3_gripper/joint_states',
-            self.gripper_state_callback,
-            qos_profile,
-            callback_group=self.callback_group
-        )
-        
-        # ------------------------------------------------------Publishers---------------------------------------------------------------
-        self.pose_command_pub = self.create_publisher(
-            Float64MultiArray,
-            '/cartesian_position_controller/commands',
-            qos_profile
-        )
+        # ------------------------------------------------------Publishers - ONLY FOR NON-REPLAY MODE---------------------------------------------------------------
+        if not self.replay_mode:
+            self.pose_command_pub = self.create_publisher(
+                Float64MultiArray,
+                '/cartesian_position_controller/commands',
+                qos_profile
+            )
 
-        # Debug observation publisher
+        # Debug observation publisher (available in both modes)
         self.observation_debug_pub = self.create_publisher(
             Float64MultiArray,
             '/bc_policy/observation_debug',
             qos_profile
         )
         
-        # TF2 setup
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        # TF2 setup - only for non-replay mode
+        if not self.replay_mode:
+            self.tf_buffer = tf2_ros.Buffer()
+            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         
-        # Control timer - control loop runs at specified frequency
+        # Control timer - control loop runs at specified frequency (only for non-replay mode)
         if not self.replay_mode:
             self.control_timer = self.create_timer(
                 1.0 / self.control_frequency,
@@ -485,12 +491,13 @@ class BCPolicyRunner(Node):
         # Clear screen and print instructions with proper formatting
         print("=" * 80)
         if self.replay_mode:
-            print("BC POLICY RUNNER - REPLAY MODE - KEYBOARD CONTROLS".center(80))
+            print("BC POLICY RUNNER - REPLAY MODE (OFFLINE) - KEYBOARD CONTROLS".center(80))
         else:
-            print("BC POLICY RUNNER - KEYBOARD CONTROLS".center(80))
+            print("BC POLICY RUNNER - LIVE MODE - KEYBOARD CONTROLS".center(80))
         print("=" * 80)
         
         if self.replay_mode:
+            print("🔄 REPLAY MODE - No robot connection required")
             print("REPLAY MODE CONTROLS:")
             print("SPACE BAR: Step through replay observations")
             print("A:         Toggle auto-step mode") 
@@ -500,6 +507,7 @@ class BCPolicyRunner(Node):
             print("I:         Show trial info")
             print("Q:         Quit the program")
         else:
+            print("🤖 LIVE MODE - Robot connection required")
             print("SPACE BAR: Start/Resume policy execution")
             print("S:         Stop policy execution")
             print("R:         Reset to home position and clear episode state")
@@ -1004,14 +1012,101 @@ class BCPolicyRunner(Node):
         except:
             pass
         
-        # Destroy action clients (from policy_runner.py)
-        try:
-            self.homing_client.destroy()
-            self.move_client.destroy()
-            self.grasp_client.destroy()
-            self.get_logger().info("Gripper action clients destroyed.")
-        except:
-            pass
+        # Destroy action clients (from policy_runner.py) - ONLY IF NOT IN REPLAY MODE
+        if not self.replay_mode:
+            try:
+                self.homing_client.destroy()
+                self.move_client.destroy()
+                self.grasp_client.destroy()
+                self.get_logger().info("Gripper action clients destroyed.")
+            except:
+                pass
+
+    # Update the print_instructions method to show replay-specific info
+    def print_instructions(self):
+        """Print keyboard control instructions"""
+        # Clear screen and print instructions with proper formatting
+        print("=" * 80)
+        if self.replay_mode:
+            print("BC POLICY RUNNER - REPLAY MODE (OFFLINE) - KEYBOARD CONTROLS".center(80))
+        else:
+            print("BC POLICY RUNNER - LIVE MODE - KEYBOARD CONTROLS".center(80))
+        print("=" * 80)
+        
+        if self.replay_mode:
+            print("🔄 REPLAY MODE - No robot connection required")
+            print("REPLAY MODE CONTROLS:")
+            print("SPACE BAR: Step through replay observations")
+            print("A:         Toggle auto-step mode") 
+            print("R:         Reset replay to beginning of trial")
+            print("N:         Next trial")
+            print("P:         Previous trial")
+            print("I:         Show trial info")
+            print("Q:         Quit the program")
+        else:
+            print("🤖 LIVE MODE - Robot connection required")
+            print("SPACE BAR: Start/Resume policy execution")
+            print("S:         Stop policy execution")
+            print("R:         Reset to home position and clear episode state")
+            print("Z:         Toggle Zero Vector Mode (48D zeros input)")
+            print("O:         Manual gripper toggle (Open/Close)")
+            print("Q:         Quit the program")
+        
+        print("=" * 80)
+        
+        if self.replay_mode:
+            # Show replay status
+            if self.replay_data:
+                total_trials = len(self.replay_data)
+                current_trial = self.replay_data[self.replay_trial]
+                total_obs = len(current_trial['observations'])
+                print(f"Replay Status: Trial {self.replay_trial}/{total_trials-1}, Step {self.replay_index}/{total_obs-1}".center(80))
+                auto_status = "ENABLED" if self.replay_auto else "DISABLED"
+                print(f"Auto-step: {auto_status} ({self.replay_step_delay}s delay)".center(80))
+            else:
+                print("Replay Status: No data loaded".center(80))
+        else:
+            # Display zero vector mode status
+            zero_status = "ENABLED" if self.zero_vector_mode else "DISABLED"
+            print(f"Zero Vector Mode: {zero_status}".center(80))
+            print("-" * 80)
+            
+            # Display current object positions and quaternions
+            print("CURRENT OBJECT STATE".center(80))
+            print("-" * 80)
+            
+            cube_names = {
+                'cube_1': 'Blue Cube',
+                'cube_2': 'Red Cube',
+                'cube_3': 'Green Cube'
+            }
+            
+            for cube_id, cube_name in cube_names.items():
+                pos = self.cube_positions[cube_id]
+                quat = self.cube_quaternions[cube_id]
+                
+                print(f"{cube_name:12} ({cube_id}):")
+                print(f"  Position:    [{pos[0]:+7.4f}, {pos[1]:+7.4f}, {pos[2]:+7.4f}]")
+                print(f"  Quaternion:  [{quat[0]:+7.4f}, {quat[1]:+7.4f}, {quat[2]:+7.4f}, {quat[3]:+7.4f}] (w,x,y,z)")
+                print()
+            
+            # Environment origin
+            origin = self.env_origin
+            print(f"Environment Origin: [{origin[0]:+7.4f}, {origin[1]:+7.4f}, {origin[2]:+7.4f}]")
+            print("-" * 80)
+            
+            # Display home position information
+            print("HOME POSITION CONFIGURATION".center(80))
+            print("-" * 80)
+            print(f"Position:    [+0.5000, +0.0000, +0.4000]")
+            print(f"Orientation: [+0.0000, +1.0000, +0.0000, +0.0000] (qx,qy,qz,qw)")
+            print(f"Description: Safe position above workspace, pointing down")
+            print("-" * 80)
+            
+            print("Status: STOPPED - Press SPACE to start".center(80))
+        
+        print("=" * 80)
+        print()  # Add blank line
 
     def publish_observation_debug(self, obs_dict: Dict[str, np.ndarray]):
         """Publish observation for debugging purposes"""

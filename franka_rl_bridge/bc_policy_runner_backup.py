@@ -6,12 +6,14 @@ This node loads a trained BC LSTM+GMM policy and runs inference on the Franka ro
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 import argparse
 import sys
 import termios
 import tty
 import select
+import json
+import os
 
 import rclpy
 from rclpy.node import Node
@@ -72,7 +74,7 @@ class LSTMGMMNetwork(nn.Module):
         )
     
     # Define the forward pass for the network
-    def forward(self, obs: Dict[str, torch.Tensor], deterministic: bool = False) -> torch.Tensor:
+    def forward(self, obs: Dict[str, torch.Tensor], deterministic: bool = True) -> torch.Tensor:
         """
         Forward pass through the network
         Args:
@@ -144,15 +146,23 @@ class LSTMGMMNetwork(nn.Module):
 # BCPolicy Runner Node
 class BCPolicyRunner(Node):
     """ROS2 Node for running Behavior Cloning policy on Franka robot"""
-    # We use 20Hz control frequency as this was the default in the original IsaacLab implementation
-    def __init__(self, policy_path: str, device: str = "cpu", deterministic: bool = False, 
-                 control_frequency: float = 20.0):
+    def __init__(self, policy_path: str, device: str = "cpu", deterministic: bool = True, 
+                 control_frequency: float = 20.0, replay_file: str = None):
         super().__init__('bc_policy_runner')
         
         # Initialize parameters
         self.device = torch.device(device)
         self.deterministic = deterministic
         self.control_frequency = control_frequency
+        
+        # NEW: Replay mode parameters
+        self.replay_mode = replay_file is not None
+        self.replay_file = replay_file
+        self.replay_data = None
+        self.replay_index = 0
+        self.replay_trial = 0
+        self.replay_auto = False
+        self.replay_step_delay = 0.01  # Seconds between auto steps
         
         # Load policy and set it to evaluation mode
         self.policy = self.load_policy(policy_path)
@@ -172,8 +182,8 @@ class BCPolicyRunner(Node):
         # Object state storage - hardcoded for now
         self.cube_positions = {
             'cube_1': np.array([0.5, 0.2, 0.0203]),
-            'cube_2': np.array([0.4, 0.25, 0.0203]),
-            'cube_3': np.array([0.5, -0.2, 0.0203])
+            'cube_2': np.array([0.3, 0.2, 0.0203]),
+            'cube_3': np.array([0.4, -0.2, 0.0203])
         }
         
         # Cube orientations (quaternions) - w, x, y, z format "IsaacLab expects quaternions in [w, x, y, z] format"
@@ -184,7 +194,7 @@ class BCPolicyRunner(Node):
         }
 
         # Environment origin (base frame reference)
-        self.env_origin = np.array([0.0, 0.0, 0.0])
+        self.env_origin = np.array([0.0, 0.0, 0.0])  # Franka's home position in the world frame
 
         # Control flags
         self.is_running = False
@@ -200,7 +210,7 @@ class BCPolicyRunner(Node):
         # --- Gripper Control Initialization (from policy_runner.py) ---
         self.gripper_goal_state = 'unknown' # 'open', 'closed', 'unknown'
         self.gripper_max_width = 0.08 # Max width for Franka Hand
-        self.gripper_speed = 0.05 # Default speed (m/s)
+        self.gripper_speed = 0.5 # Default speed (m/s)
         self.gripper_force = 50.0 # Default grasp force (N)
         self.gripper_epsilon_inner = 0.05 # Tolerance for successful grasp
         self.gripper_epsilon_outer = 0.07
@@ -226,6 +236,10 @@ class BCPolicyRunner(Node):
             depth=1
         )
         
+        # NEW: Load replay data if in replay mode
+        if self.replay_mode:
+            self.load_replay_data()
+        
         # ------------------------------------------------------Subscribers--------------------------------------------------------------
         self.eef_pose_sub = self.create_subscription(
             PoseStamped,
@@ -249,23 +263,252 @@ class BCPolicyRunner(Node):
             '/cartesian_position_controller/commands',
             qos_profile
         )
+
+        # Debug observation publisher
+        self.observation_debug_pub = self.create_publisher(
+            Float64MultiArray,
+            '/bc_policy/observation_debug',
+            qos_profile
+        )
         
         # TF2 setup
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         
         # Control timer - control loop runs at specified frequency
-        self.control_timer = self.create_timer(
-            1.0 / self.control_frequency,
-            self.control_loop,
-            callback_group=self.callback_group
-        )
+        if not self.replay_mode:
+            self.control_timer = self.create_timer(
+                1.0 / self.control_frequency,
+                self.control_loop,
+                callback_group=self.callback_group
+            )
         
         # Keyboard input timer (check for keypress every 50ms)
         self.keyboard_timer = self.create_timer(0.05, self.check_keyboard_input)
         
+        # NEW: Replay auto-step timer
+        if self.replay_mode:
+            self.replay_timer = self.create_timer(
+                self.replay_step_delay,
+                self.replay_auto_step,
+                callback_group=self.callback_group
+            )
+        
         # Print initial instructions
         self.print_instructions()
+
+    # NEW: Load replay data from JSON file
+    def load_replay_data(self):
+        """Load observation data from JSON file for replay mode"""
+        try:
+            if not os.path.exists(self.replay_file):
+                raise FileNotFoundError(f"Replay file not found: {self.replay_file}")
+                
+            with open(self.replay_file, 'r') as f:
+                self.replay_data = json.load(f)
+                
+            print(f"✅ Loaded replay data with {len(self.replay_data)} trials")
+            for i, trial in enumerate(self.replay_data):
+                num_obs = len(trial['observations'])
+                total_steps = trial['metadata']['total_steps']
+                print(f"   Trial {i}: {num_obs} observations, {total_steps} total steps")
+                
+        except Exception as e:
+            self.get_logger().error(f"Failed to load replay data: {e}")
+            raise
+
+    # NEW: Convert flat observation array back to policy format
+    def parse_replay_observation(self, obs_data: Dict) -> Dict[str, torch.Tensor]:
+        """Convert observation data from JSON to policy input format"""
+        try:
+            # Extract the arrays - these should be single values since they're from the JSON
+            eef_pos = np.array(obs_data['eef_pos'], dtype=np.float32)      # [3]
+            eef_quat = np.array(obs_data['eef_quat'], dtype=np.float32)    # [4] 
+            gripper_pos = np.array(obs_data['gripper_pos'], dtype=np.float32)  # [2]
+            object_obs = np.array(obs_data['object'], dtype=np.float32)    # [39]
+            
+            # Verify dimensions
+            assert eef_pos.shape == (3,), f"Expected eef_pos shape (3,), got {eef_pos.shape}"
+            assert eef_quat.shape == (4,), f"Expected eef_quat shape (4,), got {eef_quat.shape}"
+            assert gripper_pos.shape == (2,), f"Expected gripper_pos shape (2,), got {gripper_pos.shape}"
+            assert object_obs.shape == (39,), f"Expected object shape (39,), got {object_obs.shape}"
+            
+            # Convert to tensors with proper dimensions [batch_size=1, seq_length=1, feature_dim]
+            obs_dict = {
+                'eef_pos': torch.from_numpy(eef_pos).float().unsqueeze(0).unsqueeze(0).to(self.device),      # [1, 1, 3]
+                'eef_quat': torch.from_numpy(eef_quat).float().unsqueeze(0).unsqueeze(0).to(self.device),    # [1, 1, 4]
+                'gripper_pos': torch.from_numpy(gripper_pos).float().unsqueeze(0).unsqueeze(0).to(self.device), # [1, 1, 2]
+                'object': torch.from_numpy(object_obs).float().unsqueeze(0).unsqueeze(0).to(self.device)     # [1, 1, 39]
+            }
+            
+            return obs_dict
+            
+        except Exception as e:
+            self.get_logger().error(f"Error parsing replay observation: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    # NEW: Step through replay data
+    def replay_step(self):
+        """Step to next observation in replay mode"""
+        if not self.replay_mode or not self.replay_data:
+            return
+            
+        current_trial = self.replay_data[self.replay_trial]
+        observations = current_trial['observations']
+        
+        if self.replay_index >= len(observations):
+            print(f"\n🏁 End of trial {self.replay_trial} reached")
+            return
+            
+        # Get current observation
+        obs_data = observations[self.replay_index]
+        
+        # Parse observation
+        obs_dict = self.parse_replay_observation(obs_data)
+        if obs_dict is None:
+            return
+            
+        # Add to sequence buffer
+        self.observation_buffer.append(obs_dict)
+        
+        # Maintain buffer length
+        if len(self.observation_buffer) > self.seq_length:
+            self.observation_buffer.pop(0)
+            
+        # Pad buffer if needed (for start of episode)
+        while len(self.observation_buffer) < self.seq_length:
+            self.observation_buffer.insert(0, obs_dict)
+            
+        # Create sequence observation
+        seq_obs_dict = self.create_sequence_observation()
+        
+        # Run policy inference
+        with torch.no_grad():
+            action = self.policy(seq_obs_dict, deterministic=self.deterministic)
+            
+        # Convert action to numpy
+        action_np = action.cpu().numpy().squeeze()
+        
+        # Get recorded action if available
+        recorded_action = obs_data.get('action', [])
+        
+        # Display comparison
+        self.display_replay_comparison(obs_data, action_np, recorded_action)
+        
+        # Advance to next observation
+        self.replay_index += 1
+
+    def display_replay_comparison(self, obs_data: Dict, policy_action: np.ndarray, recorded_action: List):
+        """Display comparison between recorded observation and policy output"""
+        step = obs_data['step']
+        timestamp = obs_data['timestamp']
+
+        # Force terminal synchronization
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
+        # Use explicit newlines and avoid centering/formatting that might be affected by terminal mode
+        print("\n" + "="*80)
+        print(f"REPLAY STEP {step} (t={timestamp:.2f}s) - Trial {self.replay_trial}")
+        print("="*80)
+        print()
+
+        # Show observation breakdown
+        print("📥 INPUT OBSERVATION:")
+        eef_pos = obs_data['eef_pos']
+        eef_quat = obs_data['eef_quat']
+        gripper_pos = obs_data['gripper_pos']
+        print(f"   EEF Position:       [{eef_pos[0]:+7.4f}, {eef_pos[1]:+7.4f}, {eef_pos[2]:+7.4f}]")
+        print(f"   EEF Quaternion:     [{eef_quat[0]:+7.4f}, {eef_quat[1]:+7.4f}, {eef_quat[2]:+7.4f}, {eef_quat[3]:+7.4f}]")
+        print(f"   Gripper Pos:        [{gripper_pos[0]:+7.4f}, {gripper_pos[1]:+7.4f}]")
+        print(f"   Object state -------------------------------------------------------")
+        print(f"   Cube 1 Positions:   [{obs_data['object'][0]:+7.4f}, {obs_data['object'][1]:+7.4f}, {obs_data['object'][2]:+7.4f}]")
+        print(f"   Cube 1 Quaternion:  [{obs_data['object'][3]:+7.4f}, {obs_data['object'][4]:+7.4f}, {obs_data['object'][5]:+7.4f}, {obs_data['object'][6]:+7.4f}]")
+        print(f"   Cube 2 Positions:   [{obs_data['object'][7]:+7.4f}, {obs_data['object'][8]:+7.4f}, {obs_data['object'][9]:+7.4f}]")
+        print(f"   Cube 2 Quaternion:  [{obs_data['object'][10]:+7.4f}, {obs_data['object'][11]:+7.4f}, {obs_data['object'][12]:+7.4f}, {obs_data['object'][13]:+7.4f}]")
+        print(f"   Cube 3 Positions:   [{obs_data['object'][14]:+7.4f}, {obs_data['object'][15]:+7.4f}, {obs_data['object'][16]:+7.4f}]")
+        print(f"   Cube 3 Quaternion:  [{obs_data['object'][17]:+7.4f}, {obs_data['object'][18]:+7.4f}, {obs_data['object'][19]:+7.4f}, {obs_data['object'][20]:+7.4f}]")
+        print(f"   Gripper to Cube 1:  [{obs_data['object'][21]:+7.4f}, {obs_data['object'][22]:+7.4f}, {obs_data['object'][23]:+7.4f}]")
+        print(f"   Gripper to Cube 2:  [{obs_data['object'][24]:+7.4f}, {obs_data['object'][25]:+7.4f}, {obs_data['object'][26]:+7.4f}]")
+        print(f"   Gripper to Cube 3:  [{obs_data['object'][27]:+7.4f}, {obs_data['object'][28]:+7.4f}, {obs_data['object'][29]:+7.4f}]")
+        print(f"   Cube 1 to Cube 2: [{obs_data['object'][30]:+7.4f}, {obs_data['object'][31]:+7.4f}, {obs_data['object'][32]:+7.4f}]")
+        print(f"   Cube 2 to Cube 3: [{obs_data['object'][33]:+7.4f}, {obs_data['object'][34]:+7.4f}, {obs_data['object'][35]:+7.4f}]")
+        print(f"   Cube 1 to Cube 3: [{obs_data['object'][36]:+7.4f}, {obs_data['object'][37]:+7.4f}, {obs_data['object'][38]:+7.4f}]")
+        print()
+
+        print("🎬 POLICY OUTPUT:")
+        print(f"   Full Action:     [{', '.join([f'{x:+7.4f}' for x in policy_action])}]")
+        print(f"   EEF Pose:        [{', '.join([f'{x:+7.4f}' for x in policy_action[:7]])}] (x,y,z,qw,qx,qy,qz)")
+        print(f"   Gripper Cmd:     {policy_action[7]:+7.4f}")
+        print()
+
+        if recorded_action:
+            print("📹 RECORDED ACTION:")
+            print(f"   Full Action:     [{', '.join([f'{x:+7.4f}' for x in recorded_action])}]")
+            print(f"   EEF Pose:        [{', '.join([f'{x:+7.4f}' for x in recorded_action[:7]])}]")
+            print(f"   Gripper Cmd:     {recorded_action[7]:+7.4f}")
+            print()
+
+            # Calculate differences
+            if len(recorded_action) == len(policy_action):
+                diff = np.abs(np.array(policy_action) - np.array(recorded_action))
+                print("📊 DIFFERENCES:")
+                print(f"   Abs Difference:  [{', '.join([f'{x:+7.4f}' for x in diff])}]")
+                print(f"   Max Difference:  {np.max(diff):+7.4f}")
+                print(f"   Mean Difference: {np.mean(diff):+7.4f}")
+                print()
+
+        print("="*80)
+        print()
+        
+        # Force flush after all output
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+
+    # NEW: Auto-step through replay data
+    def replay_auto_step(self):
+        """Auto-step timer callback for replay mode"""
+        if self.replay_auto and self.replay_mode:
+            self.replay_step()
+
+    # NEW: Reset replay to beginning
+    def replay_reset(self):
+        """Reset replay to beginning of current trial"""
+        if not self.replay_mode:
+            return
+            
+        self.replay_index = 0
+        self.observation_buffer.clear()
+        self.policy.reset_hidden_states(batch_size=1)
+        print(f"🔄 Reset replay to beginning of trial {self.replay_trial}")
+
+    # NEW: Switch to different trial
+    def replay_next_trial(self):
+        """Switch to next trial in replay data"""
+        if not self.replay_mode or not self.replay_data:
+            return
+            
+        if self.replay_trial < len(self.replay_data) - 1:
+            self.replay_trial += 1
+            self.replay_reset()
+            print(f"➡️ Switched to trial {self.replay_trial}")
+        else:
+            print("Already at last trial")
+
+    def replay_prev_trial(self):
+        """Switch to previous trial in replay data"""
+        if not self.replay_mode or not self.replay_data:
+            return
+            
+        if self.replay_trial > 0:
+            self.replay_trial -= 1
+            self.replay_reset()
+            print(f"⬅️ Switched to trial {self.replay_trial}")
+        else:
+            print("Already at first trial")
 
     # Helper to wait for action servers (from policy_runner.py)
     def wait_for_action_server(self, client, name):
@@ -306,6 +549,8 @@ class BCPolicyRunner(Node):
         # Send the goal and register the callback for the result
         self.grasp_client.send_goal_async(goal_msg)
         self.gripper_goal_state = 'closed'
+
+    
         
     def eef_pose_callback(self, msg: PoseStamped):
         """Callback for end-effector pose updates"""
@@ -322,53 +567,82 @@ class BCPolicyRunner(Node):
         """Print keyboard control instructions"""
         # Clear screen and print instructions with proper formatting
         print("=" * 80)
-        print("BC POLICY RUNNER - KEYBOARD CONTROLS".center(80))
-        print("=" * 80)
-        print("SPACE BAR: Start/Resume policy execution")
-        print("S:         Stop policy execution")
-        print("R:         Reset to home position and clear episode state")
-        print("Z:         Toggle Zero Vector Mode (48D zeros input)")
-        print("Q:         Quit the program")
+        if self.replay_mode:
+            print("BC POLICY RUNNER - REPLAY MODE - KEYBOARD CONTROLS".center(80))
+        else:
+            print("BC POLICY RUNNER - KEYBOARD CONTROLS".center(80))
         print("=" * 80)
         
-        # Display zero vector mode status
-        zero_status = "ENABLED" if self.zero_vector_mode else "DISABLED"
-        print(f"Zero Vector Mode: {zero_status}".center(80))
-        print("-" * 80)
+        if self.replay_mode:
+            print("REPLAY MODE CONTROLS:")
+            print("SPACE BAR: Step through replay observations")
+            print("A:         Toggle auto-step mode") 
+            print("R:         Reset replay to beginning of trial")
+            print("N:         Next trial")
+            print("P:         Previous trial")
+            print("I:         Show trial info")
+            print("Q:         Quit the program")
+        else:
+            print("SPACE BAR: Start/Resume policy execution")
+            print("S:         Stop policy execution")
+            print("R:         Reset to home position and clear episode state")
+            print("Z:         Toggle Zero Vector Mode (48D zeros input)")
+            print("O:         Manual gripper toggle (Open/Close)")
+            print("Q:         Quit the program")
         
-        # Display current object positions and quaternions
-        print("CURRENT OBJECT STATE".center(80))
-        print("-" * 80)
+        print("=" * 80)
         
-        cube_names = {
-            'cube_1': 'Blue Cube',
-            'cube_2': 'Red Cube',
-            'cube_3': 'Green Cube'
-        }
-        
-        for cube_id, cube_name in cube_names.items():
-            pos = self.cube_positions[cube_id]
-            quat = self.cube_quaternions[cube_id]
+        if self.replay_mode:
+            # Show replay status
+            if self.replay_data:
+                total_trials = len(self.replay_data)
+                current_trial = self.replay_data[self.replay_trial]
+                total_obs = len(current_trial['observations'])
+                print(f"Replay Status: Trial {self.replay_trial}/{total_trials-1}, Step {self.replay_index}/{total_obs-1}".center(80))
+                auto_status = "ENABLED" if self.replay_auto else "DISABLED"
+                print(f"Auto-step: {auto_status} ({self.replay_step_delay}s delay)".center(80))
+            else:
+                print("Replay Status: No data loaded".center(80))
+        else:
+            # Display zero vector mode status
+            zero_status = "ENABLED" if self.zero_vector_mode else "DISABLED"
+            print(f"Zero Vector Mode: {zero_status}".center(80))
+            print("-" * 80)
             
-            print(f"{cube_name:12} ({cube_id}):")
-            print(f"  Position:    [{pos[0]:+7.4f}, {pos[1]:+7.4f}, {pos[2]:+7.4f}]")
-            print(f"  Quaternion:  [{quat[0]:+7.4f}, {quat[1]:+7.4f}, {quat[2]:+7.4f}, {quat[3]:+7.4f}] (w,x,y,z)")
-            print()
+            # Display current object positions and quaternions
+            print("CURRENT OBJECT STATE".center(80))
+            print("-" * 80)
+            
+            cube_names = {
+                'cube_1': 'Blue Cube',
+                'cube_2': 'Red Cube',
+                'cube_3': 'Green Cube'
+            }
+            
+            for cube_id, cube_name in cube_names.items():
+                pos = self.cube_positions[cube_id]
+                quat = self.cube_quaternions[cube_id]
+                
+                print(f"{cube_name:12} ({cube_id}):")
+                print(f"  Position:    [{pos[0]:+7.4f}, {pos[1]:+7.4f}, {pos[2]:+7.4f}]")
+                print(f"  Quaternion:  [{quat[0]:+7.4f}, {quat[1]:+7.4f}, {quat[2]:+7.4f}, {quat[3]:+7.4f}] (w,x,y,z)")
+                print()
+            
+            # Environment origin
+            origin = self.env_origin
+            print(f"Environment Origin: [{origin[0]:+7.4f}, {origin[1]:+7.4f}, {origin[2]:+7.4f}]")
+            print("-" * 80)
+            
+            # Display home position information
+            print("HOME POSITION CONFIGURATION".center(80))
+            print("-" * 80)
+            print(f"Position:    [+0.5000, +0.0000, +0.4000]")
+            print(f"Orientation: [+0.0000, +1.0000, +0.0000, +0.0000] (qx,qy,qz,qw)")
+            print(f"Description: Safe position above workspace, pointing down")
+            print("-" * 80)
+            
+            print("Status: STOPPED - Press SPACE to start".center(80))
         
-        # Environment origin
-        origin = self.env_origin
-        print(f"Environment Origin: [{origin[0]:+7.4f}, {origin[1]:+7.4f}, {origin[2]:+7.4f}]")
-        print("-" * 80)
-        
-        # Display home position information
-        print("HOME POSITION CONFIGURATION".center(80))
-        print("-" * 80)
-        print(f"Position:    [+0.5000, +0.0000, +0.4000]")
-        print(f"Orientation: [+0.0000, +1.0000, +0.0000, +0.0000] (qx,qy,qz,qw)")
-        print(f"Description: Safe position above workspace, pointing down")
-        print("-" * 80)
-        
-        print("Status: STOPPED - Press SPACE to start".center(80))
         print("=" * 80)
         print()  # Add blank line
 
@@ -545,30 +819,106 @@ class BCPolicyRunner(Node):
                 
             key = key.lower()
             
-            if key == ' ':  # Space bar - start/resume
-                if not self.is_running:
-                    self.start_policy()
+            # Force flush before processing commands
+            sys.stdout.flush()
+            sys.stderr.flush()
+            
+            if self.replay_mode:
+                # Replay mode commands
+                if key == ' ':  # Space bar - step through replay
+                    self.replay_step()
+                elif key == 'a':  # A - toggle auto-step
+                    self.replay_auto = not self.replay_auto
+                    status = "ENABLED" if self.replay_auto else "DISABLED"
+                    print(f"\n🔄 Auto-step mode: {status}")
+                    sys.stdout.flush()
+                elif key == 'r':  # R - reset replay
+                    self.replay_reset()
+                elif key == 'n':  # N - next trial
+                    self.replay_next_trial()
+                elif key == 'p':  # P - previous trial
+                    self.replay_prev_trial()
+                elif key == 'i':  # I - show trial info
+                    self.show_trial_info()
+                elif key == 'q':  # Q - quit
+                    self.shutdown_requested = True
+                    print("\nShutdown requested...")
+                    sys.stdout.flush()
+                    raise KeyboardInterrupt("User requested shutdown")
+            else:
+                # Normal mode commands (existing code)
+                if key == ' ':  # Space bar - start/resume
+                    if not self.is_running:
+                        self.start_policy()
+                        
+                elif key == 's':  # S - stop
+                    if self.is_running:
+                        self.stop_policy()
+                        
+                elif key == 'r':  # R - reset episode
+                    self.reset_to_home()
                     
-            elif key == 's':  # S - stop
-                if self.is_running:
-                    self.stop_policy()
+                elif key == 'z':  # Z - toggle zero vector mode
+                    self.toggle_zero_vector_mode()
                     
-            elif key == 'r':  # R - reset episode
-                self.reset_to_home()
-                
-            elif key == 'z':  # Z - toggle zero vector mode
-                self.toggle_zero_vector_mode()
-                
-            elif key == 'q':  # Q - quit (remove ord(key) == 3 check)
-                self.shutdown_requested = True
-                print("Shutdown requested...")
-                raise KeyboardInterrupt("User requested shutdown")
+                elif key == 'o':  # O - manual gripper toggle
+                    self.toggle_gripper_manual()
+                    
+                elif key == 'q':  # Q - quit
+                    self.shutdown_requested = True
+                    print("\nShutdown requested...")
+                    sys.stdout.flush()
+                    raise KeyboardInterrupt("User requested shutdown")
                 
         except KeyboardInterrupt:
             # Re-raise KeyboardInterrupt to allow proper handling
             raise
         except Exception as e:
-            print(f"Keyboard input error: {e}")
+            print(f"\nKeyboard input error: {e}")
+            sys.stdout.flush()
+
+    # NEW: Show trial information
+    def show_trial_info(self):
+        """Display information about current trial"""
+        if not self.replay_mode or not self.replay_data:
+            return
+            
+        current_trial = self.replay_data[self.replay_trial]
+        metadata = current_trial['metadata']
+        observations = current_trial['observations']
+        
+        print(f"\n{'='*60}")
+        print(f"TRIAL {self.replay_trial} INFORMATION")
+        print(f"{'='*60}")
+        print(f"Task:           {metadata['task']}")
+        print(f"Checkpoint:     {os.path.basename(metadata['checkpoint'])}")
+        print(f"Horizon:        {metadata['horizon']}")
+        print(f"Frequency:      {metadata['frequency_hz']} Hz")
+        print(f"dt:             {metadata['dt']} seconds")
+        print(f"Total steps:    {metadata['total_steps']}")
+        print(f"Observations:   {len(observations)}")
+        print(f"Current step:   {self.replay_index}")
+        print(f"Progress:       {self.replay_index}/{len(observations)-1} ({100*self.replay_index/max(1,len(observations)-1):.1f}%)")
+        print(f"{'='*60}")
+
+    def toggle_gripper_manual(self):
+        """Manually toggle gripper state between open and closed"""
+        try:
+            if self.gripper_goal_state == 'open' or self.gripper_goal_state == 'unknown':
+                # Close the gripper
+                self.close_gripper()
+                print("Manual gripper command: CLOSING")
+                self.update_status("Manual gripper: CLOSING", " - Press O again to open")
+                
+            elif self.gripper_goal_state == 'closed':
+                # Open the gripper
+                self.open_gripper()
+                print("Manual gripper command: OPENING")
+                self.update_status("Manual gripper: OPENING", " - Press O again to close")
+                
+        except Exception as e:
+            self.get_logger().error(f"Error in manual gripper control: {e}")
+            print(f"Manual gripper control failed: {e}")
 
     def start_policy(self):
         """Start policy execution"""
@@ -737,6 +1087,17 @@ class BCPolicyRunner(Node):
                 
                 # Create sequence tensor
                 seq_obs_dict = self.create_sequence_observation()
+
+            # Extract last timestep from sequence for debugging
+            last_obs_dict = {
+                'eef_pos': seq_obs_dict['eef_pos'][:, -1:, :],      # [batch_size, 1, 3]
+                'eef_quat': seq_obs_dict['eef_quat'][:, -1:, :],    # [batch_size, 1, 4]
+                'gripper_pos': seq_obs_dict['gripper_pos'][:, -1:, :], # [batch_size, 1, 2]
+                'object': seq_obs_dict['object'][:, -1:, :]         # [batch_size, 1, 39]
+            }
+            
+            # Publish last observation for debugging
+            self.publish_observation_debug(last_obs_dict)
         
             # Run policy inference
             with torch.no_grad():
@@ -751,6 +1112,8 @@ class BCPolicyRunner(Node):
     
             # Interpret action - 7D end-effector pose + 1D gripper
             eef_pose = action_np[:7]  # [x, y, z, qw, qx, qy, qz] - IsaacLab format
+            # Subtract constant offset from the z value of the end-effector pose
+            #eef_pose[2] -= 0.075  # Adjust z position to match IsaacLab's expected height
             gripper_command = action_np[7]  # Gripper command
                 
             # Extract position and quaternion from pose
@@ -807,17 +1170,61 @@ class BCPolicyRunner(Node):
             self.is_running = False
 
     def create_sequence_observation(self) -> Dict[str, torch.Tensor]:
-        """Create sequence observation from buffer"""
-        seq_obs = {}
+        """Create sequence observation from buffer for RNN input"""
+        if not self.observation_buffer:
+            return None
+            
+        try:
+            # Stack observations along sequence dimension
+            seq_obs = {}
+            
+            # Get the keys from the first observation
+            keys = list(self.observation_buffer[0].keys())
+            
+            for key in keys:
+                # Collect all tensors for this key
+                tensors_list = []
+                
+                for obs in self.observation_buffer:
+                    # Each obs[key] has shape [1, 1, feature_dim]
+                    tensor = obs[key]
+                    
+                    # Remove the middle dimension to get [1, feature_dim]
+                    if tensor.dim() == 3:
+                        tensor = tensor.squeeze(1)  # [1, 1, feature_dim] -> [1, feature_dim]
+                    
+                    tensors_list.append(tensor)
+                
+                # Stack along sequence dimension: [1, feature_dim] * seq_length -> [1, seq_length, feature_dim]
+                seq_obs[key] = torch.stack(tensors_list, dim=1)
+            
+            # Verify final shapes
+            for key, tensor in seq_obs.items():
+                expected_seq_len = len(self.observation_buffer)
+                if key == 'eef_pos':
+                    expected_shape = (1, expected_seq_len, 3)
+                elif key == 'eef_quat':
+                    expected_shape = (1, expected_seq_len, 4)
+                elif key == 'gripper_pos':
+                    expected_shape = (1, expected_seq_len, 2)
+                elif key == 'object':
+                    expected_shape = (1, expected_seq_len, 39)
+                else:
+                    continue
+                    
+                if tensor.shape != expected_shape:
+                    self.get_logger().error(f"Shape mismatch for {key}: expected {expected_shape}, got {tensor.shape}")
+                    return None
+            
+            return seq_obs
+            
+        except Exception as e:
+            self.get_logger().error(f"Error creating sequence observation: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
         
-        # Stack observations across time dimension
-        for key in ['eef_pos', 'eef_quat', 'gripper_pos', 'object']:
-            obs_list = [obs[key] for obs in self.observation_buffer]
-            # Stack to create [batch_size=1, seq_length, feature_dim]
-            seq_obs[key] = torch.stack(obs_list, dim=1)
-        
-        return seq_obs
-        
+
     def cleanup(self):
         """Cleanup resources"""
         try:
@@ -851,7 +1258,7 @@ class BCPolicyRunner(Node):
             # Create and publish message
             obs_msg = Float64MultiArray()
             obs_msg.data = obs_np.tolist()
-            self.observation_pub.publish(obs_msg)
+            self.observation_debug_pub.publish(obs_msg)
                 
         except Exception as e:
             self.get_logger().warn(f"Error publishing observation debug: {e}")
@@ -861,46 +1268,46 @@ class KeyboardInput:
     """Handles keyboard input in a non-blocking way"""
     
     def __init__(self):
-        try:
-            self.old_settings = termios.tcgetattr(sys.stdin)
-            self.terminal_setup = False
-        except:
-            # Handle case where stdin is not a terminal
-            self.old_settings = None
-            self.terminal_setup = False
+        self.old_settings = None
+        self.setup_terminal()
         
     def setup_terminal(self):
         """Setup terminal for non-blocking input"""
-        if not self.terminal_setup and self.old_settings is not None:
-            try:
-                tty.setraw(sys.stdin.fileno())
-                self.terminal_setup = True
-            except:
-                # Handle case where terminal setup fails
-                pass
+        try:
+            self.old_settings = termios.tcgetattr(sys.stdin)
+            new_settings = termios.tcgetattr(sys.stdin)
+            
+            # Use cbreak mode instead of raw mode for better formatting
+            new_settings[3] = new_settings[3] & ~(termios.ECHO | termios.ICANON)
+            new_settings[6][termios.VMIN] = 0  # Non-blocking read
+            new_settings[6][termios.VTIME] = 0  # No timeout
+            
+            termios.tcsetattr(sys.stdin, termios.TCSANOW, new_settings)
+        except:
+            pass
         
     def restore_terminal(self):
         """Restore terminal settings"""
-        if self.terminal_setup and self.old_settings is not None:
-            try:
+        try:
+            if self.old_settings:
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
-                self.terminal_setup = False
-            except:
-                # Handle case where terminal restore fails
-                pass
+                # Force flush after restoring terminal
+                sys.stdout.flush()
+                sys.stderr.flush()
+        except:
+            pass
         
     def get_key(self):
         """Get a single keypress if available"""
-        if not self.terminal_setup:
-            self.setup_terminal()
-            
         try:
-            if select.select([sys.stdin], [], [], 0.0)[0]:
-                return sys.stdin.read(1)
+            if select.select([sys.stdin], [], [], 0) == ([sys.stdin], [], []):
+                key = sys.stdin.read(1)
+                # Force flush after reading key to prevent formatting issues
+                sys.stdout.flush()
+                return key
+            return None
         except:
-            # Handle case where stdin reading fails
-            pass
-        return None
+            return None
 
 def main():
     """Main function"""
@@ -913,6 +1320,9 @@ def main():
                        help="Use deterministic policy inference")
     parser.add_argument("--frequency", type=float, default=20.0,
                        help="Control frequency in Hz")
+    # NEW: Add replay mode argument
+    parser.add_argument("--replay", type=str, default=None,
+                       help="Path to JSON file with recorded observations for replay mode")
     
     args = parser.parse_args()
     
@@ -925,7 +1335,8 @@ def main():
             policy_path=args.policy,
             device=args.device,
             deterministic=args.deterministic,
-            control_frequency=args.frequency
+            control_frequency=args.frequency,
+            replay_file=args.replay  # NEW: Pass replay file
         )
         
         # Use executor with timeout to allow KeyboardInterrupt handling
@@ -962,3 +1373,6 @@ def main():
             pass
         
         print("Shutdown complete.")
+
+if __name__ == "__main__":
+    main()

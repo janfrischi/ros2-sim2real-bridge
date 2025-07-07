@@ -12,6 +12,7 @@ import termios
 import select
 import json
 import os
+import random  # Add this import at the top
 
 import rclpy
 from rclpy.node import Node
@@ -22,8 +23,7 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64MultiArray
 from franka_msgs.action import Homing, Move, Grasp
-from action_msgs.msg import GoalStatus
-import tf2_ros
+
 
 # Import robomimic policy loading functionality
 from robomimic.utils.file_utils import policy_from_checkpoint
@@ -39,6 +39,7 @@ class BCPolicyRunner(Node):
         self.device = torch.device(device)
         self.deterministic = deterministic
         self.control_frequency = control_frequency
+        self.step_count = 0
         
         # Replay mode parameters
         self.replay_mode = replay_file is not None
@@ -47,28 +48,24 @@ class BCPolicyRunner(Node):
         self.replay_index = 0
         self.replay_trial = 0
         self.replay_auto = False
-        self.replay_step_delay = 0.01  # Seconds between auto steps
+        self.replay_execute_actions = False  # Toggle for executing actions in replay mode
+        self.replay_auto_next_trial = False  # Auto-switch to next trial when current ends
         
         # Load policy using robomimic framework and set it to evaluation mode
         self.policy, self.ckpt_dict = self.load_policy(policy_path)
-        self.policy.start_episode()  # Initialize for new episode
+
+        # Initialize for new episode
+        self.policy.start_episode()  
         
         # Robot state storage
         self.current_eef_pose = None
         self.current_gripper_positions = None
 
-        # Add sequence buffer for RNN - get sequence length from config if available
-        self.seq_length = self.get_sequence_length_from_checkpoint()
-        self.observation_buffer = []
-        
-        # Zero vector test mode
-        self.zero_vector_mode = False
-        
-        # Object state storage - hardcoded for now
+        # Object state storage - hardcoded for now try to emulate trial 0 of succesful_stack_obs1.json
         self.cube_positions = {
-            'cube_1': np.array([0.5, 0.2, 0.0203]),
-            'cube_2': np.array([0.3, 0.2, 0.0203]),
-            'cube_3': np.array([0.4, -0.2, 0.0203])
+            'cube_1': np.array([0.4221598207950592, -0.1940348893404007, 0.0203000009059906]),
+            'cube_2': np.array([0.47585567831993103, -0.046219781041145325, 0.0203000009059906]),
+            'cube_3': np.array([0.4306733310222626, -0.2792506217956543, 0.0203000009059906])
         }
         
         # Cube orientations (quaternions) - w, x, y, z format "IsaacLab expects quaternions in [w, x, y, z] format"
@@ -76,6 +73,16 @@ class BCPolicyRunner(Node):
             'cube_1': np.array([0.0, 0.0, 0.0, 1.0]),  # Identity quaternion
             'cube_2': np.array([0.0, 0.0, 0.0, 1.0]),  # Identity quaternion
             'cube_3': np.array([0.0, 0.0, 0.0, 1.0])   # Identity quaternion
+        }
+
+        # Add cube spawning configuration
+        self.cube_spawn_config = {
+            "pose_range": {
+                "x": (0.4, 0.6),
+                "y": (-0.3, 0.3), 
+                "z": (0.0203, 0.0203)
+            },
+            "min_cube_distance": 0.05  # Minimum distance between cubes to avoid overlap
         }
 
         # Environment origin (base frame reference)
@@ -149,6 +156,12 @@ class BCPolicyRunner(Node):
             qos_profile
         )
 
+        self.gripper_command_pub = self.create_publisher(
+            Float64MultiArray,
+            '/gripper_position_controller/commands',
+            qos_profile
+        )
+
         # Debug observation publisher
         self.observation_debug_pub = self.create_publisher(
             Float64MultiArray,
@@ -156,28 +169,16 @@ class BCPolicyRunner(Node):
             qos_profile
         )
         
-        # TF2 setup
-        self.tf_buffer = tf2_ros.Buffer()
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-        
-        # Control timer - control loop runs at specified frequency
-        if not self.replay_mode:
-            self.control_timer = self.create_timer(
-                1.0 / self.control_frequency,
-                self.control_loop,
-                callback_group=self.callback_group
-            )
+        # Single unified timer for both normal and replay modes
+        self.control_timer = self.create_timer(
+            1.0 / self.control_frequency,  # Period = 1/20Hz = 0.05 seconds
+            self.unified_control_loop,  # Single unified method for both modes
+            callback_group=self.callback_group,
+            clock=rclpy.clock.Clock(clock_type=rclpy.clock.ClockType.STEADY_TIME)
+        )
         
         # Keyboard input timer (check for keypress every 50ms)
         self.keyboard_timer = self.create_timer(0.05, self.check_keyboard_input)
-        
-        # Replay auto-step timer
-        if self.replay_mode:
-            self.replay_timer = self.create_timer(
-                self.replay_step_delay,
-                self.replay_auto_step,
-                callback_group=self.callback_group
-            )
         
         # Print initial instructions
         self.print_instructions()
@@ -187,7 +188,7 @@ class BCPolicyRunner(Node):
         try:
             self.get_logger().info(f"Loading policy from: {policy_path}")
             
-            # Use robomimic's policy_from_checkpoint function
+            # Use robomimic's policy_from_checkpoint function "Abstracts away the loading logic"
             policy, ckpt_dict = policy_from_checkpoint(
                 device=self.device,
                 ckpt_path=policy_path,
@@ -209,27 +210,7 @@ class BCPolicyRunner(Node):
             self.get_logger().error(f"Error loading policy: {e}")
             raise
 
-    def get_sequence_length_from_checkpoint(self) -> int:
-        """Extract sequence length from checkpoint config if available"""
-        try:
-            # Try to get sequence length from the checkpoint configuration
-            if hasattr(self.policy, 'nets') and hasattr(self.policy.nets, 'policy'):
-                # For RNN policies, try to get the sequence length
-                if hasattr(self.policy.nets.policy, 'rnn_horizon'):
-                    seq_len = self.policy.nets.policy.rnn_horizon
-                    self.get_logger().info(f"Using sequence length from checkpoint: {seq_len}")
-                    return seq_len
-            
-            # Default fallback
-            default_seq_len = 10
-            self.get_logger().info(f"Using default sequence length: {default_seq_len}")
-            return default_seq_len
-            
-        except Exception as e:
-            self.get_logger().warn(f"Could not extract sequence length from checkpoint: {e}")
-            return 10  # Default fallback
-
-    # Load replay data from JSON file
+    # Load replay data from JSON file "Data recorded during inference in IsaacSim"
     def load_replay_data(self):
         """Load observation data from JSON file for replay mode"""
         try:
@@ -259,12 +240,6 @@ class BCPolicyRunner(Node):
             gripper_pos = np.array(obs_data['gripper_pos'], dtype=np.float32)  # [2]
             object_obs = np.array(obs_data['object'], dtype=np.float32)    # [39]
             
-            # Verify dimensions
-            assert eef_pos.shape == (3,), f"Expected eef_pos shape (3,), got {eef_pos.shape}"
-            assert eef_quat.shape == (4,), f"Expected eef_quat shape (4,), got {eef_quat.shape}"
-            assert gripper_pos.shape == (2,), f"Expected gripper_pos shape (2,), got {gripper_pos.shape}"
-            assert object_obs.shape == (39,), f"Expected object shape (39,), got {object_obs.shape}"
-            
             # Return as numpy arrays for robomimic policy
             obs_dict = {
                 'eef_pos': eef_pos,
@@ -281,7 +256,7 @@ class BCPolicyRunner(Node):
             traceback.print_exc()
             return None
 
-    # Step through replay data
+    # Step through replay data - run policy inference on the observations   
     def replay_step(self):
         """Step to next observation in replay mode"""
         if not self.replay_mode or not self.replay_data:
@@ -291,21 +266,40 @@ class BCPolicyRunner(Node):
         observations = current_trial['observations']
         
         if self.replay_index >= len(observations):
-            print(f"\n🏁 End of trial {self.replay_trial} reached")
-            return
+            print(f"\n🏁 End of trial {self.replay_trial + 1} reached")
             
-        # Get current observation
+            # Auto-switch to next trial if enabled and more trials available
+            if self.replay_auto_next_trial and self.replay_trial + 1 < len(self.replay_data):
+                print(f"🔄 Auto-switching to trial {self.replay_trial + 2}")
+                self.replay_next_trial()
+                return
+            elif self.replay_trial + 1 >= len(self.replay_data):
+                print(f"🏁 All trials completed! ({len(self.replay_data)} trials)")
+                self.replay_auto = False  # Stop auto-stepping
+                return
+            else:
+                # Auto-switch disabled, just stop auto-stepping
+                self.replay_auto = False
+                return
+            
+        # Get current observation from JSON
         obs_data = observations[self.replay_index]
         
         # Parse observation
         obs_dict = self.parse_replay_observation(obs_data)
-        if obs_dict is None:
-            return
             
         # Run policy inference using robomimic policy
         try:
             action = self.policy(obs_dict)
             action_np = action if isinstance(action, np.ndarray) else action.cpu().numpy()
+            
+            # # Log observation and action together (same as normal mode)
+            # if obs_dict is not None:
+            #     self.log_observation_compact(obs_dict)
+            
+            # Execute the action only if action execution is enabled 
+            if self.replay_execute_actions:
+                self.execute_action(action_np)
             
         except Exception as e:
             self.get_logger().error(f"Policy inference failed: {e}")
@@ -389,7 +383,9 @@ class BCPolicyRunner(Node):
 
     # Auto-step through replay data
     def replay_auto_step(self):
-        """Auto-step timer callback for replay mode"""
+        """Simplified replay auto-step - timing handled by unified ROS2 timer"""
+        # This method is now simplified since timing is handled by the unified timer
+        # No manual timing checks needed - just execute the step
         if self.replay_auto and self.replay_mode:
             self.replay_step()
 
@@ -400,7 +396,6 @@ class BCPolicyRunner(Node):
             return
             
         self.replay_index = 0
-        self.observation_buffer.clear()
         self.policy.start_episode()  # Reset policy state for new episode
         print(f"🔄 Reset replay to beginning of trial {self.replay_trial}")
 
@@ -429,7 +424,67 @@ class BCPolicyRunner(Node):
         else:
             print("Already at first trial")
 
-    # Helper to wait for action servers (from policy_runner.py)
+    # Unified action execution method for both normal and replay modes
+    def execute_action(self, action_np: np.ndarray):
+        """Unified action execution for both normal and replay modes"""
+        try:
+            # Ensure it's a 1D array
+            if action_np.ndim > 1:
+                action_np = action_np.squeeze()
+            
+            # Interpret action - 7D end-effector pose + 1D gripper
+            eef_pose = action_np[:7]  # [x, y, z, qw, qx, qy, qz] - IsaacLab format
+            gripper_command = action_np[7]  # Gripper command
+                
+            # Extract position and quaternion from pose
+            position = eef_pose[:3]  # [x, y, z]
+            quaternion_sim = eef_pose[3:]  # [qw, qx, qy, qz] - IsaacLab format
+            
+            # Convert from IsaacLab [qw, qx, qy, qz] to ROS [qx, qy, qz, qw]
+            quaternion_ros = np.array([
+                quaternion_sim[1],  # qx
+                quaternion_sim[2],  # qy
+                quaternion_sim[3],  # qz
+                quaternion_sim[0]   # qw
+            ])
+            
+            # Normalize quaternion to ensure it's valid
+            quat_norm = np.linalg.norm(quaternion_ros)
+            if quat_norm > 0:
+                quaternion_ros = quaternion_ros / quat_norm
+            else:
+                self.get_logger().warn("Invalid quaternion, skipping action execution")
+                return
+            
+            # --- UNIFIED Gripper Control Logic ---
+            # Clamp gripper command to expected range [-1, 1]
+            gripper_command = np.clip(gripper_command, -1.0, 1.0)
+            
+            # Determine desired gripper state based on command
+            desired_gripper_state = 'closed' if gripper_command < 0 else 'open'
+            if desired_gripper_state != self.gripper_goal_state:
+                if desired_gripper_state == 'open':
+                    self.open_gripper()
+                elif desired_gripper_state == 'closed':
+                    self.close_gripper()
+            
+            # Create cartesian pose command: [x, y, z, qx, qy, qz, qw]
+            cartesian_pose = np.concatenate([
+                position,         # [x, y, z]
+                quaternion_ros    # [qx, qy, qz, qw]
+            ])
+            
+            # Publish cartesian pose commands to the controller
+            pose_msg = Float64MultiArray()
+            pose_msg.data = cartesian_pose.tolist()
+            self.pose_command_pub.publish(pose_msg)
+
+            self.get_logger().debug(f"Action executed: pos={position}, quat={quaternion_ros}, gripper={gripper_command}")
+            
+        except Exception as e:
+            self.get_logger().error(f"Error executing action: {e}")
+
+    # Helper to wait for action servers
     def wait_for_action_server(self, client, name):
         self.get_logger().info(f'Waiting for {name} action server...')
         while not client.wait_for_server(timeout_sec=2.0) and rclpy.ok():
@@ -448,7 +503,7 @@ class BCPolicyRunner(Node):
         self.gripper_goal_state = 'open' # Assume homing opens the gripper
 
     def open_gripper(self):
-        """Open the gripper using the action client (from policy_runner.py)"""
+        """Open the gripper using the action client"""
         goal_msg = Move.Goal()
         goal_msg.width = self.gripper_max_width
         goal_msg.speed = self.gripper_speed
@@ -475,93 +530,174 @@ class BCPolicyRunner(Node):
     
     def gripper_state_callback(self, msg: JointState):
         """Callback for gripper state updates"""
-        # Gripper should have symmetric but opposite values: [+value, -value]
+        # Gripper should have symmetric but opposite values: [+value, -value] "IsaacLab Convention"
         finger_1_pos = msg.position[0]  # First finger (positive)
-        finger_2_pos = -msg.position[1] if msg.position[1] > 0 else msg.position[1]  # Second finger (negative)
+        finger_2_pos = -msg.position[1] # Second finger (negative)
         self.current_gripper_positions = np.array([finger_1_pos, finger_2_pos])
 
-    def print_instructions(self):
-        """Print keyboard control instructions"""
-        # Clear screen and print instructions with proper formatting
-        print("=" * 80)
-        if self.replay_mode:
-            print("BC POLICY RUNNER - REPLAY MODE - KEYBOARD CONTROLS".center(80))
-        else:
-            print("BC POLICY RUNNER - KEYBOARD CONTROLS".center(80))
-        print("=" * 80)
+    def randomly_spawn_cubes(self):
+        """Randomly spawn the three cubes within the specified range"""
+        print("\n🎲 RANDOMLY SPAWNING CUBES")
+        print("=" * 50)
         
-        if self.replay_mode:
-            print("REPLAY MODE CONTROLS:")
-            print("SPACE BAR: Step through replay observations")
-            print("A:         Toggle auto-step mode") 
-            print("R:         Reset replay to beginning of trial")
-            print("N:         Next trial")
-            print("P:         Previous trial")
-            print("I:         Show trial info")
-            print("Q:         Quit the program")
-        else:
-            print("SPACE BAR: Start/Resume policy execution")
-            print("S:         Stop policy execution")
-            print("R:         Reset to home position and clear episode state")
-            print("Z:         Toggle Zero Vector Mode (48D zeros input)")
-            print("O:         Manual gripper toggle (Open/Close)")
-            print("Q:         Quit the program")
+        pose_range = self.cube_spawn_config["pose_range"]
+        min_distance = self.cube_spawn_config["min_cube_distance"]
         
-        print("=" * 80)
+        new_positions = {}
+        cube_names = ['cube_1', 'cube_2', 'cube_3']
         
-        if self.replay_mode:
-            # Show replay status
-            if self.replay_data:
-                total_trials = len(self.replay_data)
-                current_trial = self.replay_data[self.replay_trial]
-                total_obs = len(current_trial['observations'])
-                print(f"Replay Status: Trial {self.replay_trial}/{total_trials-1}, Step {self.replay_index}/{total_obs-1}".center(80))
-                auto_status = "ENABLED" if self.replay_auto else "DISABLED"
-                print(f"Auto-step: {auto_status} ({self.replay_step_delay}s delay)".center(80))
-            else:
-                print("Replay Status: No data loaded".center(80))
-        else:
-            # Display zero vector mode status
-            zero_status = "ENABLED" if self.zero_vector_mode else "DISABLED"
-            print(f"Zero Vector Mode: {zero_status}".center(80))
-            print("-" * 80)
+        for i, cube_name in enumerate(cube_names):
+            max_attempts = 50  # Prevent infinite loop
+            attempts = 0
             
-            # Display current object positions and quaternions
-            print("CURRENT OBJECT STATE".center(80))
-            print("-" * 80)
-            
-            cube_names = {
-                'cube_1': 'Blue Cube',
-                'cube_2': 'Red Cube',
-                'cube_3': 'Green Cube'
-            }
-            
-            for cube_id, cube_name in cube_names.items():
-                pos = self.cube_positions[cube_id]
-                quat = self.cube_quaternions[cube_id]
+            while attempts < max_attempts:
+                # Generate random position
+                x = random.uniform(pose_range["x"][0], pose_range["x"][1])
+                y = random.uniform(pose_range["y"][0], pose_range["y"][1])
+                z = pose_range["z"][0]  # Fixed Z value (table height)
                 
-                print(f"{cube_name:12} ({cube_id}):")
-                print(f"  Position:    [{pos[0]:+7.4f}, {pos[1]:+7.4f}, {pos[2]:+7.4f}]")
-                print(f"  Quaternion:  [{quat[0]:+7.4f}, {quat[1]:+7.4f}, {quat[2]:+7.4f}, {quat[3]:+7.4f}] (w,x,y,z)")
-                print()
+                new_pos = np.array([x, y, z])
+                
+                # Check distance from existing cubes
+                valid_position = True
+                for existing_cube, existing_pos in new_positions.items():
+                    distance = np.linalg.norm(new_pos - existing_pos)
+                    if distance < min_distance:
+                        valid_position = False
+                        break
+                
+                if valid_position:
+                    new_positions[cube_name] = new_pos
+                    break
+                
+                attempts += 1
             
-            # Environment origin
-            origin = self.env_origin
-            print(f"Environment Origin: [{origin[0]:+7.4f}, {origin[1]:+7.4f}, {origin[2]:+7.4f}]")
-            print("-" * 80)
-            
-            # Display home position information
-            print("HOME POSITION CONFIGURATION".center(80))
-            print("-" * 80)
-            print(f"Position:    [+0.5000, +0.0000, +0.4000]")
-            print(f"Orientation: [+0.0000, +1.0000, +0.0000, +0.0000] (qx,qy,qz,qw)")
-            print(f"Description: Safe position above workspace, pointing down")
-            print("-" * 80)
-            
-            print("Status: STOPPED - Press SPACE to start".center(80))
+            if attempts >= max_attempts:
+                # Fallback: use a safe position if we can't find a valid random one
+                fallback_positions = {
+                    'cube_1': np.array([0.45, -0.15, 0.0203]),
+                    'cube_2': np.array([0.5, 0.0, 0.0203]),
+                    'cube_3': np.array([0.55, 0.15, 0.0203])
+                }
+                new_positions[cube_name] = fallback_positions[cube_name]
+                print(f"⚠️ Using fallback position for {cube_name} after {max_attempts} attempts")
         
+    
+        self.cube_positions.update(new_positions)
+        
+        # Display the changes
+        print("📍 NEW CUBE POSITIONS:")
+        color_names = {
+            'cube_1': 'Blue Cube  ',
+            'cube_2': 'Red Cube   ',
+            'cube_3': 'Green Cube '
+        }
+        for cube_name, pos in new_positions.items():
+            print(f"  {color_names[cube_name]}: [{pos[0]:+7.4f}, {pos[1]:+7.4f}, {pos[2]:+7.4f}]")
+            
+        
+        print("=" * 50)
+        print("✅ Cube spawning completed!")
+        
+        # Reset policy episode state since environment changed
+        if hasattr(self, 'policy') and self.policy:
+            self.policy.start_episode()
+            print("🔄 Policy episode state reset due to environment change")
+
+    def spawn_cubes_in_pattern(self, pattern: str = "line"):
+        """Spawn cubes in predefined patterns"""
+        print(f"\n📐 SPAWNING CUBES IN {pattern.upper()} PATTERN")
+        print("=" * 50)
+        
+        if pattern == "line":
+            # Cubes in a line from left to right
+            positions = {
+                'cube_1': np.array([0.5, -0.2, 0.0203]),
+                'cube_2': np.array([0.5, 0.0, 0.0203]),
+                'cube_3': np.array([0.5, 0.2, 0.0203])
+            }
+        elif pattern == "triangle":
+            # Cubes in a triangle formation
+            positions = {
+                'cube_1': np.array([0.45, -0.1, 0.0203]),
+                'cube_2': np.array([0.45, 0.1, 0.0203]),
+                'cube_3': np.array([0.55, 0.0, 0.0203])
+            }
+        elif pattern == "stack_ready":
+            # Cubes positioned for easy stacking
+            positions = {
+                'cube_1': np.array([0.5, 0.0, 0.0203]),      # Bottom (target)
+                'cube_2': np.array([0.45, -0.15, 0.0203]),   # Source 1
+                'cube_3': np.array([0.55, 0.15, 0.0203])     # Source 2
+            }
+        else:
+            print(f"❌ Unknown pattern: {pattern}")
+            return
+        
+        # Update positions
+        self.cube_positions.update(positions)
+        
+        # Reset orientations to identity
+        for cube_name in ['cube_1', 'cube_2', 'cube_3']:
+            self.cube_quaternions[cube_name] = np.array([0.0, 0.0, 0.0, 1.0])
+        
+        # Display new positions
+        color_names = {
+            'cube_1': 'Blue Cube  ',
+            'cube_2': 'Red Cube   ',
+            'cube_3': 'Green Cube '
+        }
+        
+        print("📍 NEW CUBE POSITIONS:")
+        for cube_name, pos in positions.items():
+            print(f"  {color_names[cube_name]}: [{pos[0]:+7.4f}, {pos[1]:+7.4f}, {pos[2]:+7.4f}]")
+        
+        print(f"✅ {pattern.capitalize()} pattern applied!")
+        print("=" * 50)
+        
+        # Reset policy episode state
+        if hasattr(self, 'policy') and self.policy:
+            self.policy.start_episode()
+            print("🔄 Policy episode state reset due to environment change")
+
+    def print_instructions(self):
+        """Print control instructions"""
+        print("\n" + "=" * 80)
+        print("BC POLICY RUNNER - CONTROL INSTRUCTIONS".center(80))
         print("=" * 80)
-        print()  # Add blank line
+        
+        if self.replay_mode and self.replay_data:
+            print("Replay Mode Controls:")
+            print("  n: Next step")
+            print("  a: Toggle auto-step")
+            print("  p: Previous trial")
+            print("  m: Next trial")
+            print("  i: Show trial info")
+            print("  e: Toggle action execution in replay mode")
+            print("  t: Toggle auto-next trial")
+            print("  0: Reset to beginning of trial")
+            print("-" * 80)
+        
+        print("Robot Controls:")
+        print("  Space-Bar: Start policy execution")
+        print("  s: Stop policy execution")
+        print("  r: Reset to home position")
+        print("  o: Toggle gripper (open/close)")
+        print("-" * 80)
+        print("Environment Controls:")
+        print("  c: Randomly spawn cubes")  # New feature
+        print("  1: Spawn cubes in line pattern")
+        print("  2: Spawn cubes in triangle pattern")
+        print("  3: Spawn cubes in stack-ready pattern")
+        print("-" * 80)
+        print("General:")
+        print("  q: Quit")
+        print("=" * 80)
+        
+        # Display current status
+        status = "RUNNING" if hasattr(self, 'policy_running') and self.policy_running else "STOPPED"
+        print(f"Policy Status: {status}".center(80))
+        print("-" * 80)
 
     def compute_object_observations(self) -> np.ndarray:
         """
@@ -655,6 +791,114 @@ class BCPolicyRunner(Node):
         print(f"\n{status}{additional_info}")
         print()  # Add spacing
 
+    def save_observation_to_csv(self, obs_dict: Dict[str, np.ndarray], action_np: Optional[np.ndarray] = None):
+        """
+        Save EEF pose observations and actions to CSV file with timestamps for dynamics analysis.
+        Saves position (x,y,z), quaternion (x,y,z,w) components, and action data.
+        
+        Args:
+            obs_dict: Observation dictionary containing eef_pos and eef_quat
+            action_np: Action array [x, y, z, qw, qx, qy, qz, gripper_cmd] (optional)
+        """
+        try:
+            import csv
+            import os
+            from datetime import datetime
+            
+            # Create data directory if it doesn't exist
+            data_dir = os.path.join(os.path.expanduser("~"), "bc_policy_data")
+            os.makedirs(data_dir, exist_ok=True)
+            
+            # Generate filename with timestamp if not exists
+            if not hasattr(self, 'csv_filename'):
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                self.csv_filename = os.path.join(data_dir, f"eef_dynamics_{timestamp}.csv")
+                self.csv_file_initialized = False
+            
+            # Get current timestamp
+            current_time = datetime.now()
+            timestamp_str = current_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]  # Include milliseconds
+            
+            # Extract EEF position and quaternion from observation
+            eef_pos = obs_dict['eef_pos']      # [x, y, z]
+            eef_quat = obs_dict['eef_quat']    # [qw, qx, qy, qz] - IsaacLab format
+            
+            # Convert quaternion from IsaacLab [qw, qx, qy, qz] to standard [qx, qy, qz, qw] for CSV
+            eef_quat_standard = np.array([eef_quat[1], eef_quat[2], eef_quat[3], eef_quat[0]])
+            
+            # Prepare row data with observation
+            row_data = [
+                timestamp_str,
+                self.step_count,
+                float(eef_pos[0]),    # x
+                float(eef_pos[1]),    # y  
+                float(eef_pos[2]),    # z
+                float(eef_quat_standard[0]),  # qx
+                float(eef_quat_standard[1]),  # qy
+                float(eef_quat_standard[2]),  # qz
+                float(eef_quat_standard[3])   # qw
+            ]
+            
+            # Add action data if provided
+            if action_np is not None and len(action_np) >= 8:
+                # Action format: [x, y, z, qw, qx, qy, qz, gripper_cmd]
+                action_pos = action_np[:3]      # [x, y, z]
+                action_quat_sim = action_np[3:7] # [qw, qx, qy, qz] - IsaacLab format
+                action_gripper = action_np[7]   # gripper command
+                
+                # Convert action quaternion from IsaacLab [qw, qx, qy, qz] to standard [qx, qy, qz, qw]
+                action_quat_standard = np.array([action_quat_sim[1], action_quat_sim[2], action_quat_sim[3], action_quat_sim[0]])
+                
+                # Add action data to row
+                row_data.extend([
+                    float(action_pos[0]),         # action_x
+                    float(action_pos[1]),         # action_y
+                    float(action_pos[2]),         # action_z
+                    float(action_quat_standard[0]), # action_qx
+                    float(action_quat_standard[1]), # action_qy
+                    float(action_quat_standard[2]), # action_qz
+                    float(action_quat_standard[3]), # action_qw
+                    float(action_gripper)         # action_gripper
+                ])
+            else:
+                # Add empty action columns if no action provided
+                row_data.extend([None] * 8)  # 8 action columns
+            
+            # Write to CSV file
+            with open(self.csv_filename, 'a', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                
+                # Write header if this is the first time
+                if not self.csv_file_initialized:
+                    header = [
+                        'timestamp',
+                        'step_count',
+                        'eef_pos_x',
+                        'eef_pos_y', 
+                        'eef_pos_z',
+                        'eef_quat_x',
+                        'eef_quat_y',
+                        'eef_quat_z',
+                        'eef_quat_w',
+                        'action_x',
+                        'action_y',
+                        'action_z',
+                        'action_quat_x',
+                        'action_quat_y',
+                        'action_quat_z',
+                        'action_quat_w',
+                        'action_gripper'
+                    ]
+                    writer.writerow(header)
+                    self.csv_file_initialized = True
+                    self.get_logger().info(f"Created EEF dynamics CSV file with action data: {self.csv_filename}")
+                
+                # Write data row
+                writer.writerow(row_data)
+                
+        except Exception as e:
+            self.get_logger().error(f"Error saving observation to CSV: {e}")
+
     def check_keyboard_input(self):
         """Check for keyboard input and handle commands"""
         try:
@@ -676,9 +920,26 @@ class BCPolicyRunner(Node):
                     self.replay_auto = not self.replay_auto
                     status = "ENABLED" if self.replay_auto else "DISABLED"
                     print(f"\n🔄 Auto-step mode: {status}")
+                    if self.replay_auto:
+                        print(f"   Executing at {self.control_frequency} Hz via unified timer")
+                    sys.stdout.flush()
+                elif key == 'e':  # E - toggle action execution
+                    self.replay_execute_actions = not self.replay_execute_actions
+                    status = "ENABLED" if self.replay_execute_actions else "DISABLED"
+                    print(f"\n🤖 Action execution: {status}")
+                    sys.stdout.flush()
+                elif key == 'o':  # O - toggle gripper
+                    self.toggle_gripper_manual()
+                    print("\n🤖 Gripper toggled manually")
+                elif key == 't':  # T - toggle auto-trial switching
+                    self.replay_auto_next_trial = not self.replay_auto_next_trial
+                    status = "ENABLED" if self.replay_auto_next_trial else "DISABLED"
+                    print(f"\n🔄 Auto-switch trials: {status}")
                     sys.stdout.flush()
                 elif key == 'r':  # R - reset replay
                     self.replay_reset()
+                elif key == 'h':  # H - reset to home position
+                    self.reset_to_home()
                 elif key == 'n':  # N - next trial
                     self.replay_next_trial()
                 elif key == 'p':  # P - previous trial
@@ -691,7 +952,7 @@ class BCPolicyRunner(Node):
                     sys.stdout.flush()
                     raise KeyboardInterrupt("User requested shutdown")
             else:
-                # Normal mode commands (existing code)
+                # Normal mode commands
                 if key == ' ':  # Space bar - start/resume
                     if not self.is_running:
                         self.start_policy()
@@ -703,12 +964,21 @@ class BCPolicyRunner(Node):
                 elif key == 'r':  # R - reset episode
                     self.reset_to_home()
                     
-                elif key == 'z':  # Z - toggle zero vector mode
-                    self.toggle_zero_vector_mode()
-                    
                 elif key == 'o':  # O - manual gripper toggle
                     self.toggle_gripper_manual()
                     
+                elif key == 'c':  # C - randomly spawn cubes
+                    self.randomly_spawn_cubes()
+                    
+                elif key == '1':  # 1 - spawn cubes in line pattern
+                    self.spawn_cubes_in_pattern("line")
+                    
+                elif key == '2':  # 2 - spawn cubes in triangle pattern
+                    self.spawn_cubes_in_pattern("triangle")
+                    
+                elif key == '3':  # 3 - spawn cubes in stack-ready pattern
+                    self.spawn_cubes_in_pattern("stack_ready")
+                
                 elif key == 'q':  # Q - quit
                     self.shutdown_requested = True
                     print("\nShutdown requested...")
@@ -766,20 +1036,27 @@ class BCPolicyRunner(Node):
             print(f"Manual gripper control failed: {e}")
 
     def start_policy(self):
-        """Start policy execution"""
-        print("Starting BC policy execution...")
-        self.update_status("Status: RUNNING - Press S to stop, R to reset, Q to quit")
-        self.is_running = True
-        self.episode_active = True
-        # Reset policy state for new episode
-        self.policy.start_episode()
-    
+        """Start the policy with proper LSTM reset"""
+        if not self.is_running:
+            self.is_running = True
+            self.episode_active = True
+            self.step_count = 0
+            
+            # Always reset LSTM state when starting new policy run
+            self.policy.start_episode()
+            
+            self.update_status("Policy started", f"Control freq: {self.control_frequency}Hz")
+
     def stop_policy(self):
-        """Stop policy execution"""
-        print("Stopping BC policy execution...")
-        self.update_status("Status: STOPPED - Press SPACE to start, R to reset, Q to quit")
-        self.is_running = False
-        self.episode_active = False
+        """Stop the policy and reset for next episode"""
+        if self.is_running:
+            self.is_running = False
+            self.episode_active = False
+            
+            # Reset LSTM state when stopping
+            self.policy.start_episode()
+            
+            self.update_status("Policy stopped")
 
     def reset_to_home(self):
         """Reset robot to safe home position"""
@@ -793,7 +1070,7 @@ class BCPolicyRunner(Node):
         
         try:
             # Define safe home position (adjust these values based on your robot setup)
-            home_position = np.array([0.5, 0.0, 0.4])  # Safe position above workspace
+            home_position = np.array([0.46, 0.0, 0.266])  # Safe position above workspace
             home_quaternion_ros = np.array([1.0, 0.0, 0.0, 0.0])  # Pointing down [qx, qy, qz, qw]
             
             # Create cartesian pose command: [x, y, z, qx, qy, qz, qw]
@@ -812,7 +1089,6 @@ class BCPolicyRunner(Node):
             
             # Reset episode state
             self.policy.start_episode()
-            self.observation_buffer.clear()
             self.object_grasped = False
             self.gripper_goal_state = 'open'
             
@@ -827,30 +1103,6 @@ class BCPolicyRunner(Node):
         except Exception as e:
             self.get_logger().error(f"Error during home reset: {e}")
             self.update_status("Status: HOME FAILED - Check robot state")
-    
-    def reset_episode(self):
-        """Reset for new episode"""
-        self.policy.start_episode()
-        self.observation_buffer.clear()  # Clear sequence buffer
-        # Reset gripper state
-        self.gripper_goal_state = 'unknown'
-        print("Episode reset - Policy state cleared and gripper state reset")
-        status = "RUNNING" if self.is_running else "STOPPED"
-        action = "S to stop" if self.is_running else "SPACE to start"
-        self.update_status(f"Status: {status} (RESET) - {action}, R to reset, Q to quit")
-    
-    def toggle_zero_vector_mode(self):
-        """Toggle zero vector test mode"""
-        self.zero_vector_mode = not self.zero_vector_mode
-        mode_status = "ENABLED" if self.zero_vector_mode else "DISABLED"
-        print(f"Zero Vector Mode: {mode_status}")
-        
-        if self.zero_vector_mode:
-            self.update_status(f"Status: ZERO VECTOR MODE - Using 48D zeros for inference")
-        else:
-            status = "RUNNING" if self.is_running else "STOPPED"
-            action = "S to stop" if self.is_running else "SPACE to start"
-            self.update_status(f"Status: {status} - {action}, Z for zero mode, Q to quit")
     
     # Create observation dictionary for the policy x_t -> Input to the policy
     def create_observation(self) -> Optional[Dict[str, np.ndarray]]:
@@ -894,108 +1146,182 @@ class BCPolicyRunner(Node):
         
         return obs_dict
     
-    def create_zero_observation(self) -> Dict[str, np.ndarray]:
-        """Create observation dictionary with all zeros (48D total) for robomimic policy"""
-        obs_dict = {
-            'eef_pos': np.zeros(3, dtype=np.float32),      # [3]
-            'eef_quat': np.zeros(4, dtype=np.float32),     # [4]  
-            'gripper_pos': np.zeros(2, dtype=np.float32),  # [2]
-            'object': np.zeros(39, dtype=np.float32)       # [39]
-        }
+    def log_observation_compact(self, obs_dict: Dict[str, np.ndarray], action_np: np.ndarray = None):
+        """Compact structured observation logging for full 48D vector with optional action logging"""
+        eef_pos = obs_dict['eef_pos']           # 3D
+        eef_quat = obs_dict['eef_quat']         # 4D  
+        gripper_pos = obs_dict['gripper_pos']   # 2D
+        object_obs = obs_dict['object']         # 39D
         
-        return obs_dict
-    
-    def control_loop(self):
-        """Main control loop - runs at specified frequency - gets called by the timer"""
-        if not self.is_running or not self.episode_active:
-            return
-            
-        try:
-            if self.zero_vector_mode:
-                # Use zero observation directly
-                obs_dict = self.create_zero_observation()
-            else:
-                # Create current observation x_t
-                obs_dict = self.create_observation()
-                if obs_dict is None:
-                    return
-
-            # Publish observation for debugging (convert to flat array)
-            self.publish_observation_debug(obs_dict)
+        # Calculate total observation size
+        total_size = len(eef_pos) + len(eef_quat) + len(gripper_pos) + len(object_obs)
         
-            # Run policy inference using robomimic policy
-            action = self.policy(obs_dict)
+        print(f"\n┌{'─'*100}┐")
+        print(f"│ STEP {self.step_count:<6} │ FULL 48D OBSERVATION VECTOR ({total_size} elements) │")
+        print(f"├{'─'*100}┤")
+        
+        # End-Effector Position (elements 0-2)
+        print(f"│ EEF POS [0-2]   │ X:{eef_pos[0]:8.5f} │ Y:{eef_pos[1]:8.5f} │ Z:{eef_pos[2]:8.5f} │")
+        
+        # End-Effector Quaternion (elements 3-6)
+        print(f"│ EEF QUAT [3-6]  │ X:{eef_quat[0]:8.5f} │ Y:{eef_quat[1]:8.5f} │ Z:{eef_quat[2]:8.5f} │ W:{eef_quat[3]:8.5f} │")
+        
+        # Gripper Position (elements 7-8)
+        gripper_width = abs(gripper_pos[0]) + abs(gripper_pos[1])
+        gripper_state = "OPEN" if gripper_width > 0.04 else "CLOSED"
+        print(f"│ GRIPPER [7-8]   │ F1:{gripper_pos[0]:8.5f} │ F2:{gripper_pos[1]:8.5f} │ Width:{gripper_width:7.4f} │ {gripper_state:<6} │")
+        
+        print(f"├{'─'*100}┤")
+        print(f"│ OBJECT STATE [9-47] - 39 ELEMENTS │")
+        print(f"├{'─'*100}┤")
+        
+        # Parse object observations (39D breakdown)
+        idx = 0
+        
+        # Cube 1 Position + Quaternion (elements 9-15)
+        cube1_pos = object_obs[idx:idx+3]
+        cube1_quat = object_obs[idx+3:idx+7]
+        print(f"│ CUBE 1 [9-15]   │ Pos: [{cube1_pos[0]:6.3f}, {cube1_pos[1]:6.3f}, {cube1_pos[2]:6.3f}] │ Quat: [{cube1_quat[0]:5.2f}, {cube1_quat[1]:5.2f}, {cube1_quat[2]:5.2f}, {cube1_quat[3]:5.2f}] │")
+        idx += 7
+        
+        # Cube 2 Position + Quaternion (elements 16-22)
+        cube2_pos = object_obs[idx:idx+3]
+        cube2_quat = object_obs[idx+3:idx+7]
+        print(f"│ CUBE 2 [16-22]  │ Pos: [{cube2_pos[0]:6.3f}, {cube2_pos[1]:6.3f}, {cube2_pos[2]:6.3f}] │ Quat: [{cube2_quat[0]:5.2f}, {cube2_quat[1]:5.2f}, {cube2_quat[2]:5.2f}, {cube2_quat[3]:5.2f}] │")
+        idx += 7
+        
+        # Cube 3 Position + Quaternion (elements 23-29)
+        cube3_pos = object_obs[idx:idx+3]
+        cube3_quat = object_obs[idx+3:idx+7]
+        print(f"│ CUBE 3 [23-29]  │ Pos: [{cube3_pos[0]:6.3f}, {cube3_pos[1]:6.3f}, {cube3_pos[2]:6.3f}] │ Quat: [{cube3_quat[0]:5.2f}, {cube3_quat[1]:5.2f}, {cube3_quat[2]:5.2f}, {cube3_quat[3]:5.2f}] │")
+        idx += 7
+        
+        # Relative positions EEF to Cubes (elements 30-38)
+        print(f"├{'─'*100}┤")
+        print(f"│ EEF TO CUBE RELATIVE POSITIONS │")
+        print(f"├{'─'*100}┤")
+        for i in range(3):
+            rel_pos = object_obs[idx:idx+3]
+            distance = np.linalg.norm(rel_pos)
+            element_range = f"[{30+i*3}-{32+i*3}]"
+            print(f"│ EEF→CUBE{i+1} {element_range} │ Rel: [{rel_pos[0]:7.4f}, {rel_pos[1]:7.4f}, {rel_pos[2]:7.4f}] │ Dist: {distance:6.4f}m │")
+            idx += 3
+        
+        # Cube-to-Cube relative positions (elements 39-47)
+        print(f"├{'─'*100}┤")
+        print(f"│ CUBE TO CUBE RELATIVE POSITIONS │")
+        print(f"├{'─'*100}┤")
+        
+        # Cube 1 to Cube 2 (elements 39-41)
+        cube1_to_cube2 = object_obs[idx:idx+3]
+        distance_1_2 = np.linalg.norm(cube1_to_cube2)
+        print(f"│ CUBE1→CUBE2 [39-41] │ Rel: [{cube1_to_cube2[0]:7.4f}, {cube1_to_cube2[1]:7.4f}, {cube1_to_cube2[2]:7.4f}] │ Dist: {distance_1_2:6.4f}m │")
+        idx += 3
+        
+        # Cube 2 to Cube 3 (elements 42-44)
+        cube2_to_cube3 = object_obs[idx:idx+3]
+        distance_2_3 = np.linalg.norm(cube2_to_cube3)
+        print(f"│ CUBE2→CUBE3 [42-44] │ Rel: [{cube2_to_cube3[0]:7.4f}, {cube2_to_cube3[1]:7.4f}, {cube2_to_cube3[2]:7.4f}] │ Dist: {distance_2_3:6.4f}m │")
+        idx += 3
+        
+        # Cube 1 to Cube 3 (elements 45-47)
+        cube1_to_cube3 = object_obs[idx:idx+3]
+        distance_1_3 = np.linalg.norm(cube1_to_cube3)
+        print(f"│ CUBE1→CUBE3 [45-47] │ Rel: [{cube1_to_cube3[0]:7.4f}, {cube1_to_cube3[1]:7.4f}, {cube1_to_cube3[2]:7.4f}] │ Dist: {distance_1_3:6.4f}m │")
+        idx += 3
+        
+        # Action logging section (if action is provided)
+        if action_np is not None:
+            print(f"├{'─'*100}┤")
+            print(f"│ POLICY ACTION OUTPUT - 8D ACTION VECTOR │")
+            print(f"├{'─'*100}┤")
             
-            # Convert action to numpy array for processing
-            if isinstance(action, torch.Tensor):
-                action_np = action.cpu().numpy()
-            else:
-                action_np = action
-                
             # Ensure it's a 1D array
             if action_np.ndim > 1:
                 action_np = action_np.squeeze()
             
-            # Log action output when in zero vector mode
-            if self.zero_vector_mode:
-                self.get_logger().info(f"Zero vector input -> Action output: {action_np}", throttle_duration_sec=1.0)
+            # Parse action components
+            eef_pose_action = action_np[:7]  # [x, y, z, qw, qx, qy, qz] - IsaacLab format
+            gripper_action = action_np[7]    # Gripper command
+            
+            # End-effector pose action
+            action_pos = eef_pose_action[:3]
+            action_quat = eef_pose_action[3:]  # [qw, qx, qy, qz]
+            
+            print(f"│ ACTION POS [0-2] │ X:{action_pos[0]:8.5f} │ Y:{action_pos[1]:8.5f} │ Z:{action_pos[2]:8.5f} │")
+            print(f"│ ACTION QUAT[3-6] │ W:{action_quat[0]:8.5f} │ X:{action_quat[1]:8.5f} │ Y:{action_quat[2]:8.5f} │ Z:{action_quat[3]:8.5f} │")
+            
+            # Gripper action analysis
+            gripper_cmd_clamped = np.clip(gripper_action, -1.0, 1.0)
+            gripper_pos_cmd = (gripper_cmd_clamped + 1.0) * 0.04  # Maps [-1,1] to [0, 0.08]
+            gripper_state_cmd = "CLOSE" if gripper_action < 0 else "OPEN"
+            
+            print(f"│ ACTION GRIP [7]  │ Raw:{gripper_action:8.5f} │ Clamped:{gripper_cmd_clamped:8.5f} │ Pos:{gripper_pos_cmd:7.4f} │ Cmd:{gripper_state_cmd:<6} │")
+            
+            # Action magnitude analysis
+            pos_change_mag = np.linalg.norm(action_pos - eef_pos)
+            quat_diff = np.abs(action_quat - eef_quat).sum()
+            
+            print(f"├{'─'*100}┤")
+            print(f"│ ACTION ANALYSIS │ Pos Change: {pos_change_mag:6.4f}m │ Quat Diff: {quat_diff:6.4f} │ Gripper Δ: {gripper_action:7.4f} │")
+        
+        # Summary statistics
+        print(f"├{'─'*100}┤")
+        eef_to_cubes_min_dist = min([np.linalg.norm(object_obs[21+i*3:24+i*3]) for i in range(3)])
+        cube_to_cube_min_dist = min([distance_1_2, distance_2_3, distance_1_3])
+        print(f"│ SUMMARY         │ Total: {total_size} elements │ EEF height: {eef_pos[2]:6.4f}m │ Closest EEF→Cube: {eef_to_cubes_min_dist:6.4f}m │ Closest Cube→Cube: {cube_to_cube_min_dist:6.4f}m │")
+        print(f"└{'─'*100}┘")
+        # Increment step count
+        self.step_count += 1
     
-            # Interpret action - 7D end-effector pose + 1D gripper
-            eef_pose = action_np[:7]  # [x, y, z, qw, qx, qy, qz] - IsaacLab format
-            gripper_command = action_np[7]  # Gripper command
-                
-            # Extract position and quaternion from pose
-            position = eef_pose[:3]  # [x, y, z]
-            quaternion_sim = eef_pose[3:]  # [qw, qx, qy, qz] - IsaacLab format
+    def unified_control_loop(self):
+        """Unified control loop with consistent timing for both normal and replay modes"""
+        if self.shutdown_requested:
+            return
             
-            # Convert from IsaacLab [qw, qx, qy, qz] to ROS [qx, qy, qz, qw]
-            quaternion_ros = np.array([
-                quaternion_sim[1],  # qx
-                quaternion_sim[2],  # qy
-                quaternion_sim[3],  # qz
-                quaternion_sim[0]   # qw
-            ])
-            
-            # Normalize quaternion to ensure it's valid
-            quat_norm = np.linalg.norm(quaternion_ros)
-            if quat_norm > 0:
-                quaternion_ros = quaternion_ros / quat_norm
-            else:
-                self.get_logger().warn("Invalid quaternion received, skipping control step")
-                return
-            
-            # In zero vector mode, don't send commands to robot - just log the outputs
-            if self.zero_vector_mode:
-                self.get_logger().info(f"Zero mode - Position: [{position[0]:.4f}, {position[1]:.4f}, {position[2]:.4f}]", throttle_duration_sec=1.0)
-                self.get_logger().info(f"Zero mode - Quaternion: [{quaternion_ros[0]:.4f}, {quaternion_ros[1]:.4f}, {quaternion_ros[2]:.4f}, {quaternion_ros[3]:.4f}]", throttle_duration_sec=1.0)
-                self.get_logger().info(f"Zero mode - Gripper: {gripper_command:.4f}", throttle_duration_sec=1.0)
-                return
-            
-            # --- Gripper Control Logic ---
-            desired_gripper_state = 'closed' if gripper_command < 0 else 'open'
-            
-            # Gripper Action Execution Logic: 
-            # Execute if gripper action if state hase changed
-            if desired_gripper_state != self.gripper_goal_state:
-                if desired_gripper_state == 'open':
-                    self.open_gripper()
-                elif desired_gripper_state == 'closed':
-                    self.close_gripper()
-            
-            # Create cartesian pose command: [x, y, z, qx, qy, qz, qw]
-            cartesian_pose = np.concatenate([
-                position,         # [x, y, z]
-                quaternion_ros    # [qx, qy, qz, qw]
-            ])
-            
-            # Publish cartesian pose commands to the controller
-            pose_msg = Float64MultiArray()
-            pose_msg.data = cartesian_pose.tolist()
-            self.pose_command_pub.publish(pose_msg)
-    
+        try:
+            if self.replay_mode and self.replay_auto:
+                # Handle replay mode execution
+                self.handle_replay_step()
+            elif not self.replay_mode and self.is_running and self.episode_active:
+                # Handle normal mode execution
+                self.handle_normal_step()
         except Exception as e:
-            self.get_logger().error(f"Error in control loop: {e}")
-            self.is_running = False
+            self.get_logger().error(f"Unified control loop error: {e}")
+
+    def handle_normal_step(self):
+        """Handle normal mode execution with proper timing"""
+        try:
+            # Create observation for the policy
+            obs_dict = self.create_observation()
+            if obs_dict is not None:
+                
+                # Run policy inference
+                action = self.policy(obs_dict)
+                action_np = action if isinstance(action, np.ndarray) else action.cpu().numpy()
+
+                # Save observation for the normal policy inference
+                self.save_observation_to_csv(obs_dict, action_np)
+                
+                # Log observation and action together
+                self.log_observation_compact(obs_dict, action_np)
+                
+                # Execute the action
+                self.execute_action(action_np)
+
+        except Exception as e:
+            self.get_logger().error(f"Normal mode execution error: {e}")
+
+    def handle_replay_step(self):
+        """Handle replay mode execution with proper timing"""
+        if not self.replay_mode or not self.replay_data:
+            return
+        
+        try:
+            # Execute one replay step - no manual timing checks needed
+            self.replay_step()
+        except Exception as e:
+            self.get_logger().error(f"Replay mode execution error: {e}")
 
     def cleanup(self):
         """Cleanup resources"""

@@ -115,14 +115,66 @@ class EEFTrajectoryPlotter:
         return pos_stats
     
     def create_trajectory_plot(self):
-        """Create 3D trajectory plot"""
+        """Create 3D trajectory plot with coordinate frame at origin"""
         if self.data is None:
             return None
         
         # Create 3D trajectory plot
         fig = go.Figure()
         
-        # Add 3D trajectory line
+        # Add coordinate frame at origin
+        origin = [0, 0, 0]
+        axis_length = 0.1  # 10cm axes
+        
+        # X-axis (red)
+        fig.add_trace(go.Scatter3d(
+            x=[origin[0], origin[0] + axis_length],
+            y=[origin[1], origin[1]],
+            z=[origin[2], origin[2]],
+            mode='lines',
+            line=dict(color='red', width=8),
+            name='X-axis',
+            showlegend=True,
+            hovertemplate='X-axis<extra></extra>'
+        ))
+        
+        # Y-axis (green)
+        fig.add_trace(go.Scatter3d(
+            x=[origin[0], origin[0]],
+            y=[origin[1], origin[1] + axis_length],
+            z=[origin[2], origin[2]],
+            mode='lines',
+            line=dict(color='green', width=8),
+            name='Y-axis',
+            showlegend=True,
+            hovertemplate='Y-axis<extra></extra>'
+        ))
+        
+        # Z-axis (blue)
+        fig.add_trace(go.Scatter3d(
+            x=[origin[0], origin[0]],
+            y=[origin[1], origin[1]],
+            z=[origin[2], origin[2] + axis_length],
+            mode='lines',
+            line=dict(color='blue', width=8),
+            name='Z-axis',
+            showlegend=True,
+            hovertemplate='Z-axis<extra></extra>'
+        ))
+        
+        # Add origin point
+        fig.add_trace(go.Scatter3d(
+            x=[origin[0]],
+            y=[origin[1]],
+            z=[origin[2]],
+            mode='markers',
+            marker=dict(size=8, color='black', symbol='circle'),
+            name='Origin',
+            showlegend=True,
+            hovertemplate='<b>Origin (0,0,0)</b><extra></extra>'
+        ))
+        
+        # Add 3D trajectory line with colorbar positioned on the left
         fig.add_trace(go.Scatter3d(
             x=self.data['eef_pos_x'],
             y=self.data['eef_pos_y'],
@@ -132,7 +184,14 @@ class EEFTrajectoryPlotter:
                 color=self.data['time_seconds'],
                 colorscale='Viridis',
                 width=4,
-                colorbar=dict(title="Time (s)")
+                colorbar=dict(
+                    title="Time (s)",
+                    x=-0.15,  # Position colorbar on the left side (-0.15 means 15% to the left of the plot)
+                    xanchor="right",  # Anchor the right side of the colorbar to the x position
+                    thickness=15,  # Thickness of the colorbar
+                    len=0.8,  # Length of the colorbar (80% of plot height)
+                    yanchor="middle"  # Center the colorbar vertically
+                )
             ),
             marker=dict(
                 size=3,
@@ -179,9 +238,9 @@ class EEFTrajectoryPlotter:
                          '<extra></extra>'
         ))
         
-        # Update layout
+        # Update layout with adjusted margins to accommodate left-side colorbar
         fig.update_layout(
-            title='End-Effector 3D Trajectory',
+            title='End-Effector 3D Trajectory with Coordinate Frame',
             scene=dict(
                 xaxis_title='X (m)',
                 yaxis_title='Y (m)',
@@ -191,8 +250,9 @@ class EEFTrajectoryPlotter:
                     eye=dict(x=1.5, y=1.5, z=1.5)
                 )
             ),
-            height=600,
-            showlegend=True
+            height=1000,
+            showlegend=True,
+            margin=dict(l=100, r=50, t=50, b=50)  # Increase left margin to make room for colorbar
         )
         
         return fig
@@ -360,18 +420,20 @@ class EEFTrajectoryPlotter:
         if self.data is None:
             return None
         
-        # Create subplots - Updated layout: left side has position/quaternion, right side has 3D/velocity
+        # Create subplots with better proportions for 3D plot
         fig = make_subplots(
             rows=2, cols=2,
-            subplot_titles=('Position vs Time', '3D Trajectory', 
-                          'Quaternion vs Time', 'Velocity vs Time'),
+            subplot_titles=('EE-Position vs Time', '3D Trajectory with Coordinate Frame', 
+                          'EE-Quaternion vs Time', 'EE-Velocity vs Time'),
             specs=[[{'type': 'scatter'}, {'type': 'scatter3d'}],
                    [{'type': 'scatter'}, {'type': 'scatter'}]],
-            vertical_spacing=0.12,
-            horizontal_spacing=0.08
+            vertical_spacing=0.15,
+            horizontal_spacing=0.05,
+            column_widths=[0.45, 0.55],  # More space for 3D plot
+            row_heights=[0.55, 0.45]     # More space for top row
         )
         
-        # Add position vs time (moved to row 1, col 1)
+        # Add position vs time (row 1, col 1)
         colors = ['red', 'green', 'blue']
         for i, axis in enumerate(['x', 'y', 'z']):
             col = f'eef_pos_{axis}'
@@ -384,15 +446,71 @@ class EEFTrajectoryPlotter:
                     line=dict(color=colors[i], width=2),
                     legendgroup='position'
                 ), row=1, col=1)
+    
+        # Calculate adaptive coordinate frame size
+        pos_ranges = {
+            'x': self.data['eef_pos_x'].max() - self.data['eef_pos_x'].min(),
+            'y': self.data['eef_pos_y'].max() - self.data['eef_pos_y'].min(),
+            'z': self.data['eef_pos_z'].max() - self.data['eef_pos_z'].min()
+        }
+        max_range = max(pos_ranges.values())
+        axis_length = max(0.08, min(0.25, max_range * 0.4))  # 40% of trajectory range
+    
+        # Add coordinate frame to 3D plot (row 1, col 2)
+        origin = [0, 0, 0]
         
-        # Add 3D trajectory (moved to row 1, col 2)
+        # X-axis (red)
+        fig.add_trace(go.Scatter3d(
+            x=[origin[0], origin[0] + axis_length],
+            y=[origin[1], origin[1]],
+            z=[origin[2], origin[2]],
+            mode='lines',
+            line=dict(color='red', width=8),  # Thicker lines
+            name='X-axis',
+            showlegend=False
+        ), row=1, col=2)
+        
+        # Y-axis (green)
+        fig.add_trace(go.Scatter3d(
+            x=[origin[0], origin[0]],
+            y=[origin[1], origin[1] + axis_length],
+            z=[origin[2], origin[2]],
+            mode='lines',
+            line=dict(color='green', width=8),  # Thicker lines
+            name='Y-axis',
+            showlegend=False
+        ), row=1, col=2)
+        
+        # Z-axis (blue)
+        fig.add_trace(go.Scatter3d(
+            x=[origin[0], origin[0]],
+            y=[origin[1], origin[1]],
+            z=[origin[2], origin[2] + axis_length],
+            mode='lines',
+            line=dict(color='blue', width=8),  # Thicker lines
+            name='Z-axis',
+            showlegend=False
+        ), row=1, col=2)
+        
+        # Add origin point
+        fig.add_trace(go.Scatter3d(
+            x=[origin[0]],
+            y=[origin[1]],
+            z=[origin[2]],
+            mode='markers',
+            marker=dict(size=10, color='black', symbol='circle'),  # Larger marker
+            name='Origin',
+            showlegend=False
+        ), row=1, col=2)
+        
+        # Add 3D trajectory (row 1, col 2)
         fig.add_trace(go.Scatter3d(
             x=self.data['eef_pos_x'],
             y=self.data['eef_pos_y'],
             z=self.data['eef_pos_z'],
             mode='lines+markers',
-            line=dict(color=self.data['time_seconds'], colorscale='Viridis', width=3),
-            marker=dict(size=2, color=self.data['time_seconds'], colorscale='Viridis'),
+            line=dict(color=self.data['time_seconds'], colorscale='Viridis', width=4),
+            marker=dict(size=3, color=self.data['time_seconds'], colorscale='Viridis'),
             name='Trajectory',
             showlegend=False
         ), row=1, col=2)
@@ -410,7 +528,7 @@ class EEFTrajectoryPlotter:
                     line=dict(color=quat_colors[i], width=2),
                     legendgroup='quaternion'
                 ), row=2, col=1)
-        
+    
         # Add velocity vs time (stays at row 2, col 2)
         if len(self.data) > 1:
             dt = np.diff(self.data['time_seconds'])
@@ -419,30 +537,47 @@ class EEFTrajectoryPlotter:
             for i, axis in enumerate(['x', 'y', 'z']):
                 col = f'eef_pos_{axis}'
                 if col in self.data.columns:
-                    dx = np.diff(self.data[col])
-                    velocity = dx / dt
+                    velocities = np.diff(self.data[col]) / dt
                     fig.add_trace(go.Scatter(
                         x=time_mid,
-                        y=velocity,
+                        y=velocities,
                         mode='lines',
                         name=f'Vel {axis.upper()}',
                         line=dict(color=colors[i], width=2),
                         legendgroup='velocity'
                     ), row=2, col=2)
-        
+    
         # Update layout
         fig.update_layout(
-            height=800,
+            height=900,  # Increased height
             title_text=f"End-Effector Dynamics Dashboard - {os.path.basename(self.csv_file)}",
             showlegend=True
         )
         
-        # Update 3D scene (now at row 1, col 2)
+        # Update 3D scene with better scaling
         fig.update_scenes(
             xaxis_title='X (m)',
             yaxis_title='Y (m)',
             zaxis_title='Z (m)',
-            aspectmode='data'
+            aspectmode='cube',  # Better aspect ratio
+            camera=dict(
+                eye=dict(x=1.3, y=1.3, z=1.3),  # Better camera position
+                up=dict(x=0, y=0, z=1),
+                center=dict(x=0, y=0, z=0)
+            ),
+            # Set explicit ranges with padding
+            xaxis=dict(
+                range=[min(0, self.data['eef_pos_x'].min()-0.1), 
+                       max(axis_length, self.data['eef_pos_x'].max()+0.1)]
+            ),
+            yaxis=dict(
+                range=[min(0, self.data['eef_pos_y'].min()-0.1), 
+                       max(axis_length, self.data['eef_pos_y'].max()+0.1)]
+            ),
+            zaxis=dict(
+                range=[min(0, self.data['eef_pos_z'].min()-0.1), 
+                       max(axis_length, self.data['eef_pos_z'].max()+0.1)]
+            )
         )
         
         # Update axis labels - Updated positions

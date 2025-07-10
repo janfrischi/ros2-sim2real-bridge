@@ -2,6 +2,10 @@
 """
 Simple EEF Trajectory and Action Comparison Script
 Compares end-effector position, quaternion, and action data from CSV (real robot) and JSON (simulation) files.
+
+Usage:
+    python3 plot_comparison.py --csv_file path/to/robot_data.csv --json_file path/to/simulation_data.json --trial 0
+
 """
 
 import pandas as pd

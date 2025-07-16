@@ -16,7 +16,7 @@ import threading
 class PoseSender(Node):
     """ROS2 Node for sending pose commands to the cartesian position controller"""
     
-    def __init__(self, topic_name="/cartesian_position_controller/commands", publish_rate=10.0):
+    def __init__(self, topic_name="/cartesian_position_controller/commands", publish_rate=20.0):
         super().__init__('pose_sender')
         
         # Store current pose [x, y, z, qx, qy, qz, qw]

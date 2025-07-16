@@ -61,7 +61,7 @@ class BCPolicyRunner(Node):
         self.current_eef_pose = None
         self.current_gripper_positions = None
 
-        # Object state storage - hardcoded for now try to emulate trial 0 of succesful_stack_obs1.json
+        # Object state storage -> TODO: Enable dynamic object state updates
         self.cube_positions = {
             'cube_1': np.array([0.4221598207950592, -0.1940348893404007, 0.0203000009059906]),
             'cube_2': np.array([0.47585567831993103, -0.046219781041145325, 0.0203000009059906]),
@@ -104,10 +104,9 @@ class BCPolicyRunner(Node):
         self.gripper_max_width = 0.08 # Max width for Franka Hand
         self.gripper_speed = 0.5 # Default speed (m/s)
         self.gripper_force = 50.0 # Default grasp force (N)
-        self.gripper_epsilon_inner = 0.05 # Tolerance for successful grasp
+        self.gripper_epsilon_inner = 0.05
         self.gripper_epsilon_outer = 0.07
         
-
         # Action clients for gripper, Homing, Move and Grasp are action definitions
         self.homing_client = ActionClient(self, Homing, '/fr3_gripper/homing', callback_group=self.callback_group)
         self.move_client = ActionClient(self, Move, '/fr3_gripper/move', callback_group=self.callback_group)
@@ -169,7 +168,7 @@ class BCPolicyRunner(Node):
             qos_profile
         )
         
-        # Single unified timer for both normal and replay modes
+        # --------------------------------- Single timer for both normal and replay modes ---------------------------------
         self.control_timer = self.create_timer(
             1.0 / self.control_frequency,  # Period = 1/20Hz = 0.05 seconds
             self.unified_control_loop,  # Single unified method for both modes

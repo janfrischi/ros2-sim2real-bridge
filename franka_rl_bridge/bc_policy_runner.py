@@ -13,6 +13,7 @@ import select
 import json
 import os
 import random  # Add this import at the top
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -119,6 +120,18 @@ class BCPolicyRunner(Node):
         # Perform initial homing
         self.home_gripper()
         # --- End Gripper Control Initialization ---
+        
+        # --- Enhanced Gripper Control Initialization (ADD THIS AFTER EXISTING GRIPPER INIT) ---
+        import threading
+        import time
+        from action_msgs.msg import GoalStatus
+
+        # Enhanced gripper state management (minimal addition)
+        self.gripper_action_in_progress = False
+        self.gripper_action_lock = threading.Lock()
+        self.gripper_last_command_time = 0.0
+        self.gripper_command_cooldown = 1.0  # 1 second between commands
+        # --- End Enhanced Gripper Control Initialization ---
         
         # Setup QoS (Quality of Service) profiles
         qos_profile = QoSProfile(
@@ -502,26 +515,103 @@ class BCPolicyRunner(Node):
         self.gripper_goal_state = 'open' # Assume homing opens the gripper
 
     def open_gripper(self):
-        """Open the gripper using the action client"""
-        goal_msg = Move.Goal()
-        goal_msg.width = self.gripper_max_width
-        goal_msg.speed = self.gripper_speed
-        # Send the goal and register the callback for the result
-        self.move_client.send_goal_async(goal_msg)
-        self.gripper_goal_state = 'open'
+        """Open the gripper using the action client with safety checks"""
+        with self.gripper_action_lock:
+            current_time = time.time()
+            
+            # Safety checks
+            if self.gripper_action_in_progress:
+                self.get_logger().debug("Gripper action in progress, skipping open command")
+                return
+            
+            if current_time - self.gripper_last_command_time < self.gripper_command_cooldown:
+                self.get_logger().debug("Gripper cooldown active, skipping open command")
+                return
+                
+            if self.gripper_goal_state == 'open':
+                return  # Already open
+                
+            # Set state and send command
+            self.gripper_action_in_progress = True
+            self.gripper_last_command_time = current_time
+        
+        try:
+            goal_msg = Move.Goal()
+            goal_msg.width = self.gripper_max_width
+            goal_msg.speed = self.gripper_speed
+            
+            # Send goal with result callback
+            goal_future = self.move_client.send_goal_async(goal_msg)
+            goal_future.add_done_callback(self._gripper_goal_callback)
+            
+            self.gripper_goal_state = 'open'
+            self.get_logger().debug("Safe gripper OPEN command sent")
+            
+        except Exception as e:
+            with self.gripper_action_lock:
+                self.gripper_action_in_progress = False
+            self.get_logger().error(f"Failed to send gripper open command: {e}")
 
     def close_gripper(self):
-        """Close the gripper using the action client"""
-        goal_msg = Grasp.Goal()
-        goal_msg.width = 0.0
-        goal_msg.speed = self.gripper_speed
-        goal_msg.force = self.gripper_force
-        goal_msg.epsilon.inner = self.gripper_epsilon_inner
-        goal_msg.epsilon.outer = self.gripper_epsilon_outer
+        """Close the gripper using the action client with safety checks"""
+        with self.gripper_action_lock:
+            current_time = time.time()
+            
+            # Safety checks
+            if self.gripper_action_in_progress:
+                self.get_logger().debug("Gripper action in progress, skipping close command")
+                return
+            
+            if current_time - self.gripper_last_command_time < self.gripper_command_cooldown:
+                self.get_logger().debug("Gripper cooldown active, skipping close command")
+                return
+                
+            if self.gripper_goal_state == 'closed':
+                return  # Already closed
+                
+            # Set state and send command
+            self.gripper_action_in_progress = True
+            self.gripper_last_command_time = current_time
+        
+        try:
+            goal_msg = Grasp.Goal()
+            goal_msg.width = 0.0
+            goal_msg.speed = self.gripper_speed
+            goal_msg.force = self.gripper_force
+            goal_msg.epsilon.inner = self.gripper_epsilon_inner
+            goal_msg.epsilon.outer = self.gripper_epsilon_outer
 
-        # Send the goal and register the callback for the result
-        self.grasp_client.send_goal_async(goal_msg)
-        self.gripper_goal_state = 'closed'
+            # Send goal with result callback
+            goal_future = self.grasp_client.send_goal_async(goal_msg)
+            goal_future.add_done_callback(self._gripper_goal_callback)
+            
+            self.gripper_goal_state = 'closed'
+            self.get_logger().debug("Safe gripper CLOSE command sent")
+            
+        except Exception as e:
+            with self.gripper_action_lock:
+                self.gripper_action_in_progress = False
+            self.get_logger().error(f"Failed to send gripper close command: {e}")
+
+    def _gripper_goal_callback(self, future):
+        """Minimal callback to reset gripper action state"""
+        try:
+            goal_handle = future.result()
+            if goal_handle.accepted:
+                # Get result to reset state when complete
+                result_future = goal_handle.get_result_async()
+                result_future.add_done_callback(self._gripper_result_callback)
+            else:
+                with self.gripper_action_lock:
+                    self.gripper_action_in_progress = False
+        except Exception:
+            with self.gripper_action_lock:
+                self.gripper_action_in_progress = False
+
+    def _gripper_result_callback(self, future):
+        """Reset gripper state when action completes"""
+        with self.gripper_action_lock:
+            self.gripper_action_in_progress = False
 
     def eef_pose_callback(self, msg: PoseStamped):
         """Callback for end-effector pose updates"""
@@ -603,6 +693,177 @@ class BCPolicyRunner(Node):
             self.policy.start_episode()
             print("🔄 Policy episode state reset due to environment change")
 
+    def spawn_cubes_preset(self, preset_name: str = "default"):
+        """Spawn cubes using predefined pose presets"""
+        print(f"\n🎯 SPAWNING CUBES - PRESET: {preset_name.upper()}")
+        print("=" * 50)
+        
+        # Define all preset configurations
+        presets = {
+            "default": {
+                'cube_1': np.array([0.4221598207950592, -0.1940348893404007, 0.0203]),
+                'cube_2': np.array([0.47585567831993103, -0.046219781041145325, 0.0203]),
+                'cube_3': np.array([0.4306733310222626, -0.2792506217956543, 0.0203])
+            },
+            "custom_1": {
+                'cube_1': np.array([0.400, 0.200, 0.020]),
+                'cube_2': np.array([0.600, 0.300, 0.020]),
+                'cube_3': np.array([0.400, -0.200, 0.020])
+            },
+            "wide_spread": {
+                'cube_1': np.array([0.35, -0.25, 0.0203]),
+                'cube_2': np.array([0.65, 0.0, 0.0203]),
+                'cube_3': np.array([0.45, 0.25, 0.0203])
+            },
+            "tight_cluster": {
+                'cube_1': np.array([0.50, -0.08, 0.0203]),
+                'cube_2': np.array([0.50, 0.0, 0.0203]),
+                'cube_3': np.array([0.50, 0.08, 0.0203])
+            },
+            "corner_formation": {
+                'cube_1': np.array([0.40, -0.20, 0.0203]),  # Bottom left
+                'cube_2': np.array([0.40, 0.20, 0.0203]),   # Top left
+                'cube_3': np.array([0.60, 0.0, 0.0203])     # Right center
+            },
+            "stacking_ready": {
+                'cube_1': np.array([0.50, 0.0, 0.0203]),    # Target base
+                'cube_2': np.array([0.40, -0.15, 0.0203]),  # Source 1
+                'cube_3': np.array([0.60, 0.15, 0.0203])    # Source 2
+            },
+            "manipulation_test": {
+                'cube_1': np.array([0.45, -0.10, 0.0203]),
+                'cube_2': np.array([0.55, 0.10, 0.0203]),
+                'cube_3': np.array([0.50, 0.0, 0.0203])
+            },
+            "reach_challenge": {
+                'cube_1': np.array([0.35, -0.30, 0.0203]),  # Far left
+                'cube_2': np.array([0.65, 0.30, 0.0203]),   # Far right
+                'cube_3': np.array([0.50, 0.0, 0.0203])     # Center
+            },
+            "pick_place_demo": {
+                'cube_1': np.array([0.42, -0.18, 0.0203]),  # Pick source
+                'cube_2': np.array([0.58, 0.18, 0.0203]),   # Place target area
+                'cube_3': np.array([0.50, -0.05, 0.0203])   # Obstacle/intermediate
+            },
+            "sorting_task": {
+                'cube_1': np.array([0.38, -0.25, 0.0203]),  # Left bin
+                'cube_2': np.array([0.50, 0.0, 0.0203]),    # Center (to sort)
+                'cube_3': np.array([0.62, 0.25, 0.0203])    # Right bin
+            },
+            "assembly_line": {
+                'cube_1': np.array([0.40, 0.0, 0.0203]),    # Input
+                'cube_2': np.array([0.50, 0.0, 0.0203]),    # Processing
+                'cube_3': np.array([0.60, 0.0, 0.0203])     # Output
+            },
+            "circular_arrangement": {
+                'cube_1': np.array([0.50, -0.12, 0.0203]),  # Bottom
+                'cube_2': np.array([0.44, 0.06, 0.0203]),   # Top left
+                'cube_3': np.array([0.56, 0.06, 0.0203])    # Top right
+            },
+            "precision_test": {
+                'cube_1': np.array([0.48, -0.05, 0.0203]),
+                'cube_2': np.array([0.50, 0.0, 0.0203]),
+                'cube_3': np.array([0.52, 0.05, 0.0203])
+            },
+            "learning_progression_1": {
+                'cube_1': np.array([0.45, -0.15, 0.0203]),  # Easy reach
+                'cube_2': np.array([0.50, 0.0, 0.0203]),    # Medium
+                'cube_3': np.array([0.55, 0.15, 0.0203])    # Harder reach
+            },
+            "learning_progression_2": {
+                'cube_1': np.array([0.40, -0.20, 0.0203]),  # Further challenge
+                'cube_2': np.array([0.60, 0.20, 0.0203]),   # Cross workspace
+                'cube_3': np.array([0.50, 0.0, 0.0203])     # Central reference
+            },
+            "workspace_corners": {
+                'cube_1': np.array([0.35, -0.30, 0.0203]),  # Bottom left corner
+                'cube_2': np.array([0.35, 0.30, 0.0203]),   # Top left corner
+                'cube_3': np.array([0.65, 0.0, 0.0203])     # Right edge
+            }
+        }
+    
+        # Check if preset exists
+        if preset_name not in presets:
+            available_presets = list(presets.keys())
+            print(f"❌ Unknown preset: {preset_name}")
+            print(f"📋 Available presets: {', '.join(available_presets)}")
+            return
+        
+        # Get the preset positions
+        positions = presets[preset_name]
+        
+        # Update cube positions
+        self.cube_positions.update(positions)
+        
+        # Reset orientations to identity for all presets
+        for cube_name in ['cube_1', 'cube_2', 'cube_3']:
+            self.cube_quaternions[cube_name] = np.array([0.0, 0.0, 0.0, 1.0])
+        
+        # Display new positions with enhanced formatting
+        color_names = {
+            'cube_1': '🔵 Blue Cube ',
+            'cube_2': '🔴 Red Cube  ',
+            'cube_3': '🟢 Green Cube'
+        }
+        
+        print("📍 NEW CUBE POSITIONS:")
+        for cube_name, pos in positions.items():
+            print(f"  {color_names[cube_name]}: [{pos[0]:+7.4f}, {pos[1]:+7.4f}, {pos[2]:+7.4f}]")
+        
+        # Calculate workspace metrics
+        distances = []
+        cube_positions_list = list(positions.values())
+        for i in range(len(cube_positions_list)):
+            for j in range(i+1, len(cube_positions_list)):
+                dist = np.linalg.norm(cube_positions_list[i] - cube_positions_list[j])
+                distances.append(dist)
+        
+        min_distance = min(distances)
+        max_distance = max(distances)
+        avg_distance = np.mean(distances)
+        
+        print(f"\n📊 WORKSPACE METRICS:")
+        print(f"   Min distance between cubes: {min_distance:.4f}m")
+        print(f"   Max distance between cubes: {max_distance:.4f}m")
+        print(f"   Avg distance between cubes: {avg_distance:.4f}m")
+        
+        print(f"\n✅ Preset '{preset_name}' applied successfully!")
+        print("=" * 50)
+        
+        # Reset policy episode state
+        if hasattr(self, 'policy') and self.policy:
+            self.policy.start_episode()
+            print("🔄 Policy episode state reset due to environment change")
+
+    def list_cube_presets(self):
+        """List all available cube presets with descriptions"""
+        presets_info = {
+            "default": "Original IsaacLab training positions",
+            "custom_1": "Your requested custom positions",
+            "wide_spread": "Cubes spread across full workspace",
+            "tight_cluster": "Cubes close together in center",
+            "corner_formation": "L-shaped corner arrangement",
+            "stacking_ready": "Optimal positions for stacking tasks",
+            "manipulation_test": "Standard manipulation testing layout",
+            "reach_challenge": "Tests maximum reach capabilities",
+            "pick_place_demo": "Demonstration of pick-and-place",
+            "sorting_task": "Three-bin sorting scenario",
+            "assembly_line": "Linear assembly sequence",
+            "circular_arrangement": "Triangular/circular formation",
+            "precision_test": "Close spacing for precision testing",
+            "learning_progression_1": "Beginner difficulty progression",
+            "learning_progression_2": "Advanced difficulty progression",
+            "workspace_corners": "Extreme workspace positions"
+        }
+        
+        print("\n📋 AVAILABLE CUBE PRESETS")
+        print("=" * 60)
+        for preset, description in presets_info.items():
+            print(f"  {preset:<22} │ {description}")
+        print("=" * 60)
+        print("Usage: Press the corresponding number key or use 'p' + preset name")
+        print()
+
     def spawn_cubes_in_pattern(self, pattern: str = "line"):
         """Spawn cubes in predefined patterns"""
         print(f"\n📐 SPAWNING CUBES IN {pattern.upper()} PATTERN")
@@ -661,42 +922,37 @@ class BCPolicyRunner(Node):
 
     def print_instructions(self):
         """Print control instructions"""
-        print("\n" + "=" * 80)
-        print("BC POLICY RUNNER - CONTROL INSTRUCTIONS".center(80))
-        print("=" * 80)
+        print("\n" + "=" * 90)
+        print("BC POLICY RUNNER - CONTROL INSTRUCTIONS".center(90))
+        print("=" * 90)
         
         if self.replay_mode and self.replay_data:
-            print("Replay Mode Controls:")
-            print("  n: Next step")
-            print("  a: Toggle auto-step")
-            print("  p: Previous trial")
-            print("  m: Next trial")
-            print("  i: Show trial info")
-            print("  e: Toggle action execution in replay mode")
-            print("  t: Toggle auto-next trial")
-            print("  0: Reset to beginning of trial")
-            print("-" * 80)
+            # ... existing replay mode instructions ...
+            pass
         
         print("Robot Controls:")
         print("  Space-Bar: Start policy execution")
         print("  s: Stop policy execution")
         print("  r: Reset to home position")
         print("  o: Toggle gripper (open/close)")
-        print("-" * 80)
-        print("Environment Controls:")
-        print("  c: Randomly spawn cubes")  # New feature
-        print("  1: Spawn cubes in line pattern")
-        print("  2: Spawn cubes in triangle pattern")
-        print("  3: Spawn cubes in stack-ready pattern")
-        print("-" * 80)
-        print("General:")
-        print("  q: Quit")
-        print("=" * 80)
-        
-        # Display current status
-        status = "RUNNING" if hasattr(self, 'policy_running') and self.policy_running else "STOPPED"
-        print(f"Policy Status: {status}".center(80))
-        print("-" * 80)
+        print("-" * 90)
+        print("Environment Controls - Basic Patterns:")
+        print("  c: Random spawn      │ 1: Line pattern      │ 2: Triangle pattern  │ 3: Stack-ready")
+        print("-" * 90)
+        print("Environment Controls - Number Key Presets:")
+        print("  4: Default           │ 5: Custom positions  │ 6: Wide spread       │ 7: Tight cluster")
+        print("  8: Corner formation  │ 9: Stacking ready    │ 0: Manipulation test")
+        print("-" * 90)
+        print("Environment Controls - Letter Key Presets:")
+        print("  a: Reach challenge   │ b: Pick-place demo   │ d: Sorting task       │ e: Assembly line")
+        print("  f: Circular arrange  │ h: Precision test    │ i: Learning prog 1    │ j: Learning prog 2")
+        print("  k: Workspace corners")
+        print("-" * 90)
+        print("Information & Control:")
+        print("  l: List all presets  │ g: Emergency gripper reset │ q: Quit")
+        print("=" * 90)
+        print("💡 TIP: Use 'l' to see detailed descriptions of all presets")
+        print()
 
     def compute_object_observations(self) -> np.ndarray:
         """
@@ -912,44 +1168,8 @@ class BCPolicyRunner(Node):
             sys.stderr.flush()
             
             if self.replay_mode:
-                # Replay mode commands
-                if key == ' ':  # Space bar - step through replay
-                    self.replay_step()
-                elif key == 'a':  # A - toggle auto-step
-                    self.replay_auto = not self.replay_auto
-                    status = "ENABLED" if self.replay_auto else "DISABLED"
-                    print(f"\n🔄 Auto-step mode: {status}")
-                    if self.replay_auto:
-                        print(f"   Executing at {self.control_frequency} Hz via unified timer")
-                    sys.stdout.flush()
-                elif key == 'e':  # E - toggle action execution
-                    self.replay_execute_actions = not self.replay_execute_actions
-                    status = "ENABLED" if self.replay_execute_actions else "DISABLED"
-                    print(f"\n🤖 Action execution: {status}")
-                    sys.stdout.flush()
-                elif key == 'o':  # O - toggle gripper
-                    self.toggle_gripper_manual()
-                    print("\n🤖 Gripper toggled manually")
-                elif key == 't':  # T - toggle auto-trial switching
-                    self.replay_auto_next_trial = not self.replay_auto_next_trial
-                    status = "ENABLED" if self.replay_auto_next_trial else "DISABLED"
-                    print(f"\n🔄 Auto-switch trials: {status}")
-                    sys.stdout.flush()
-                elif key == 'r':  # R - reset replay
-                    self.replay_reset()
-                elif key == 'h':  # H - reset to home position
-                    self.reset_to_home()
-                elif key == 'n':  # N - next trial
-                    self.replay_next_trial()
-                elif key == 'p':  # P - previous trial
-                    self.replay_prev_trial()
-                elif key == 'i':  # I - show trial info
-                    self.show_trial_info()
-                elif key == 'q':  # Q - quit
-                    self.shutdown_requested = True
-                    print("\nShutdown requested...")
-                    sys.stdout.flush()
-                    raise KeyboardInterrupt("User requested shutdown")
+                # ... existing replay mode commands ...
+                pass
             else:
                 # Normal mode commands
                 if key == ' ':  # Space bar - start/resume
@@ -968,6 +1188,12 @@ class BCPolicyRunner(Node):
                     
                 elif key == 'c':  # C - randomly spawn cubes
                     self.randomly_spawn_cubes()
+
+                elif key == 'g':  # G - emergency gripper reset
+                    with self.gripper_action_lock:
+                        self.gripper_action_in_progress = False
+                        self.gripper_last_command_time = 0.0
+                    print("\n🚨 Emergency gripper reset performed")
                     
                 elif key == '1':  # 1 - spawn cubes in line pattern
                     self.spawn_cubes_in_pattern("line")
@@ -978,14 +1204,66 @@ class BCPolicyRunner(Node):
                 elif key == '3':  # 3 - spawn cubes in stack-ready pattern
                     self.spawn_cubes_in_pattern("stack_ready")
                 
+                # PRESET COMMANDS (Numbers 4-9, 0)
+                elif key == '4':  # 4 - default preset
+                    self.spawn_cubes_preset("default")
+                    
+                elif key == '5':  # 5 - custom_1 preset (your requested positions)
+                    self.spawn_cubes_preset("custom_1")
+                    
+                elif key == '6':  # 6 - wide_spread preset
+                    self.spawn_cubes_preset("wide_spread")
+                    
+                elif key == '7':  # 7 - tight_cluster preset
+                    self.spawn_cubes_preset("tight_cluster")
+                    
+                elif key == '8':  # 8 - corner_formation preset
+                    self.spawn_cubes_preset("corner_formation")
+                    
+                elif key == '9':  # 9 - stacking_ready preset
+                    self.spawn_cubes_preset("stacking_ready")
+                    
+                elif key == '0':  # 0 - manipulation_test preset
+                    self.spawn_cubes_preset("manipulation_test")
+                
+                # NEW LETTER COMMANDS FOR REMAINING PRESETS
+                elif key == 'a':  # A - reach_challenge preset
+                    self.spawn_cubes_preset("reach_challenge")
+                    
+                elif key == 'b':  # B - pick_place_demo preset
+                    self.spawn_cubes_preset("pick_place_demo")
+                    
+                elif key == 'd':  # D - sorting_task preset
+                    self.spawn_cubes_preset("sorting_task")
+                    
+                elif key == 'e':  # E - assembly_line preset
+                    self.spawn_cubes_preset("assembly_line")
+                    
+                elif key == 'f':  # F - circular_arrangement preset
+                    self.spawn_cubes_preset("circular_arrangement")
+                    
+                elif key == 'h':  # H - precision_test preset
+                    self.spawn_cubes_preset("precision_test")
+                    
+                elif key == 'i':  # I - learning_progression_1 preset
+                    self.spawn_cubes_preset("learning_progression_1")
+                    
+                elif key == 'j':  # J - learning_progression_2 preset
+                    self.spawn_cubes_preset("learning_progression_2")
+                    
+                elif key == 'k':  # K - workspace_corners preset
+                    self.spawn_cubes_preset("workspace_corners")
+                    
+                elif key == 'l':  # L - list all presets
+                    self.list_cube_presets()
+                
                 elif key == 'q':  # Q - quit
                     self.shutdown_requested = True
                     print("\nShutdown requested...")
                     sys.stdout.flush()
                     raise KeyboardInterrupt("User requested shutdown")
-                
+                    
         except KeyboardInterrupt:
-            # Re-raise KeyboardInterrupt to allow proper handling
             raise
         except Exception as e:
             print(f"\nKeyboard input error: {e}")

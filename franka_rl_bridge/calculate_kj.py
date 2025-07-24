@@ -229,7 +229,7 @@ if __name__ == "__main__":
     print("This tool converts Cartesian stiffness to joint space stiffness")
     
     # Define sample Cartesian stiffness (typical impedance control values)
-    Kc = np.diag([1200, 1200, 1200, 40, 40, 40])  # N/m and Nm/rad
+    Kc = np.diag([1200, 1200, 1200, 80, 80, 80])  # N/m and Nm/rad
     print(f"Using Cartesian stiffness: diag{np.diag(Kc).tolist()}")
     
     # Example Jacobian at a typical pose (6×7)

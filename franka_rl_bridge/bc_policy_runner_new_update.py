@@ -9,6 +9,7 @@ from typing import Dict, Optional, List
 import argparse
 import sys
 import termios
+import threading
 import select
 import json
 import os
@@ -62,7 +63,7 @@ class BCPolicyRunner(Node):
         self.current_eef_pose = None
         self.current_gripper_positions = None
 
-        # Object state storage
+        # Object state storage -> TODO: Enable dynamic object state updates
         self.cube_positions = {
             'cube_1': np.array([0.4221598207950592, -0.1940348893404007, 0.0203000009059906]),
             'cube_2': np.array([0.47585567831993103, -0.046219781041145325, 0.0203000009059906]),
@@ -75,14 +76,6 @@ class BCPolicyRunner(Node):
             'cube_2': np.array([0.0, 0.0, 0.0, 1.0]),  # Identity quaternion
             'cube_3': np.array([0.0, 0.0, 0.0, 1.0])   # Identity quaternion
         }
-
-        # Dynamic object state storage
-        self.cube_attached = None # None, 'cube_2', 'cube_3'
-        self.last_gripper_state = 'open' # Track gripper state changes
-        self.grasp_threshold = 0.06 # Width below which we consider the gripper "closed"
-        self.release_threshold = 0.07 # Width above which we consider gripper "open"
-        self.proximity_threshold = 0.05 # Distance threshold for grasp condition 
-        self.grasp_sequence_count = 0 # 0: no grasps, 1: first grasp (cube_2) 2: second grasp (cube_3)
 
         # Add cube spawning configuration
         self.cube_spawn_config = {
@@ -116,6 +109,17 @@ class BCPolicyRunner(Node):
         self.gripper_epsilon_inner = 0.05
         self.gripper_epsilon_outer = 0.07
         
+        # Grasping sequence and attachment tracking
+        self.grasp_sequence_count = 0  # 0: no grasps, 1: first grasp (cube_2), 2: second grasp (cube_3)
+        self.cube_attached = None      # None, 'cube_2', or 'cube_3'
+        self.last_gripper_state = 'open'  # Track gripper state changes
+        self.grasp_threshold = 0.02    # Width below which we consider gripper "closed"
+        self.release_threshold = 0.06  # Width above which we consider gripper "open"
+        self.gripper_state_stable_count = 0  # Counter for stable state detection
+        self.required_stable_frames = 3      # Frames needed to confirm state change
+
+        
+        
         # Action clients for gripper, Homing, Move and Grasp are action definitions
         self.homing_client = ActionClient(self, Homing, '/fr3_gripper/homing', callback_group=self.callback_group)
         self.move_client = ActionClient(self, Move, '/fr3_gripper/move', callback_group=self.callback_group)
@@ -130,8 +134,7 @@ class BCPolicyRunner(Node):
         # --- End Gripper Control Initialization ---
         
         # --- Enhanced Gripper Control Initialization (ADD THIS AFTER EXISTING GRIPPER INIT) ---
-        import threading
-        import time
+        #import threading
         from action_msgs.msg import GoalStatus
 
         # Enhanced gripper state management (minimal addition)
@@ -212,17 +215,17 @@ class BCPolicyRunner(Node):
             policy, ckpt_dict = policy_from_checkpoint(
                 device=self.device,
                 ckpt_path=policy_path,
-                verbose=False
+                verbose=True
             )
             
             self.get_logger().info("Successfully loaded policy using robomimic")
             self.get_logger().info(f"Algorithm: {ckpt_dict.get('algo_name', 'Unknown')}")
             
-            # # Log shape metadata if available
-            # if 'shape_metadata' in ckpt_dict:
-            #     shape_meta = ckpt_dict['shape_metadata']
-            #     self.get_logger().info(f"Action dimension: {shape_meta.get('ac_dim', 'Unknown')}")
-            #     self.get_logger().info(f"Observation keys: {list(shape_meta.get('all_shapes', {}).keys())}")
+            # Log shape metadata if available
+            if 'shape_metadata' in ckpt_dict:
+                shape_meta = ckpt_dict['shape_metadata']
+                self.get_logger().info(f"Action dimension: {shape_meta.get('ac_dim', 'Unknown')}")
+                self.get_logger().info(f"Observation keys: {list(shape_meta.get('all_shapes', {}).keys())}")
             
             return policy, ckpt_dict
             
@@ -313,6 +316,10 @@ class BCPolicyRunner(Node):
             action = self.policy(obs_dict)
             action_np = action if isinstance(action, np.ndarray) else action.cpu().numpy()
             
+            # # Log observation and action together (same as normal mode)
+            # if obs_dict is not None:
+            #     self.log_observation_compact(obs_dict)
+            
             # Execute the action only if action execution is enabled 
             if self.replay_execute_actions:
                 self.execute_action(action_np)
@@ -329,6 +336,124 @@ class BCPolicyRunner(Node):
         
         # Advance to next observation
         self.replay_index += 1
+
+    def detect_gripper_state_change(self) -> Optional[str]:
+        """
+        Detect reliable gripper state changes (open->closed or closed->open)
+        Returns 'closed', 'open', or None if no reliable change detected
+        """
+        if self.current_gripper_positions is None:
+            return None
+        
+        # Calculate current gripper width
+        current_width = abs(self.current_gripper_positions[0]) + abs(self.current_gripper_positions[1])
+        
+        # Determine current state based on width
+        if current_width < self.grasp_threshold:
+            current_state = 'closed'
+        elif current_width > self.release_threshold:
+            current_state = 'open'
+        else:
+            # In between - maintain previous state
+            current_state = self.last_gripper_state
+        
+        # Check if state has changed
+        if current_state != self.last_gripper_state:
+            self.gripper_state_stable_count += 1
+            
+            # Only register change after stable frames
+            if self.gripper_state_stable_count >= self.required_stable_frames:
+                previous_state = self.last_gripper_state
+                self.last_gripper_state = current_state
+                self.gripper_state_stable_count = 0
+                
+                self.get_logger().info(f"Gripper state change detected: {previous_state} -> {current_state}")
+                return current_state
+        else:
+            # State is stable, reset counter
+            self.gripper_state_stable_count = 0
+        
+        return None
+    
+    def handle_cube_attachment(self, gripper_state_change: str):
+        """
+        Handle cube attachment/detachment based on gripper state changes
+        """
+        if gripper_state_change == 'closed':
+            # Gripper just closed - attach next cube in sequence
+            if self.grasp_sequence_count == 0:
+                # First grasp - attach cube_2
+                self.cube_attached = 'cube_2'
+                self.grasp_sequence_count = 1
+                print(f"🔴 CUBE_2 (Red) ATTACHED to gripper - Dynamic tracking enabled")
+                self.get_logger().info("Cube_2 attached - enabling dynamic position tracking")
+                
+            elif self.grasp_sequence_count == 1 and self.cube_attached is None:
+                # Second grasp - attach cube_3
+                self.cube_attached = 'cube_3'
+                self.grasp_sequence_count = 2
+                print(f"🟢 CUBE_3 (Green) ATTACHED to gripper - Dynamic tracking enabled")
+                self.get_logger().info("Cube_3 attached - enabling dynamic position tracking")
+                
+            else:
+                print(f"⚠️ Unexpected grasp detected - ignoring")
+        
+        elif gripper_state_change == 'open':
+            # Gripper just opened - detach current cube
+            if self.cube_attached == 'cube_2':
+                print(f"🔴 CUBE_2 (Red) RELEASED - Dynamic tracking disabled")
+                self.get_logger().info("Cube_2 released - disabling dynamic position tracking")
+                self.cube_attached = None
+                
+            elif self.cube_attached == 'cube_3':
+                print(f"🟢 CUBE_3 (Green) RELEASED - Dynamic tracking disabled")
+                self.get_logger().info("Cube_3 released - disabling dynamic position tracking")
+                self.cube_attached = None
+                
+            else:
+                print(f"⚠️ Gripper opened but no cube was attached")
+
+
+    def update_attached_cube_pose(self):
+        """
+        Update the position and orientation of the attached cube to match the end-effector
+        """
+        if self.cube_attached is None or self.current_eef_pose is None:
+            return
+        
+        # Get current end-effector pose
+        eef_pos = np.array([
+            self.current_eef_pose.pose.position.x,
+            self.current_eef_pose.pose.position.y,
+            self.current_eef_pose.pose.position.z
+        ])
+        
+        # Get current end-effector quaternion [qx, qy, qz, qw] from ROS
+        eef_quat_ros = np.array([
+            self.current_eef_pose.pose.orientation.x,  # qx
+            self.current_eef_pose.pose.orientation.y,  # qy
+            self.current_eef_pose.pose.orientation.z,  # qz
+            self.current_eef_pose.pose.orientation.w   # qw
+        ])
+        
+        # Convert to [qw, qx, qy, qz] format for cube storage (IsaacLab format)
+        eef_quat_isaac = np.array([
+            eef_quat_ros[3],  # qw
+            eef_quat_ros[0],  # qx
+            eef_quat_ros[1],  # qy
+            eef_quat_ros[2]   # qz
+        ])
+        
+        # Apply slight offset to cube position (cube is slightly below gripper)
+        cube_offset = np.array([0.0, 0.0, 0.0])  # 5cm below gripper
+        attached_cube_pos = eef_pos + cube_offset
+        
+        # Update the attached cube's pose
+        self.cube_positions[self.cube_attached] = attached_cube_pos
+        self.cube_quaternions[self.cube_attached] = eef_quat_isaac
+        
+        # Optional: Log the update (comment out if too verbose)
+        # self.get_logger().debug(f"Updated {self.cube_attached} pose: pos={attached_cube_pos}, quat={eef_quat_isaac}")
 
     def display_replay_comparison(self, obs_data: Dict, policy_action: np.ndarray, recorded_action: List):
         """Display comparison between recorded observation and policy output"""
@@ -617,97 +742,6 @@ class BCPolicyRunner(Node):
         with self.gripper_action_lock:
             self.gripper_action_in_progress = False
 
-    def detect_gripper_state_change(self): 
-        """
-        Detect reliable gripper state changes (open->closed or closed->open)
-        Returns 'closed', 'open', or None if no reliable change detected
-        """
-        if self.current_gripper_positions is None: 
-            return None
-
-        # Calculate the current gripper width
-        current_width = abs(self.current_gripper_positions[0]) + abs(self.current_gripper_positions[1])
-
-        # Determine the current state based on the width "Hysteresis logic"
-        if current_width < self.grasp_threshold:
-            current_state = 'closed'
-        elif current_width > self.release_threshold:
-            current_state = 'open'
-        else: 
-            # In the dead zone - maintain previous state to avoid oscillation
-            current_state = self.last_gripper_state
-
-        # If new state differs from previous state -> Update internal state and return new state
-        if current_state != self.last_gripper_state:
-            self.last_gripper_state = current_state
-            return current_state
-        
-        # If no change detected, return None
-        return None 
-    
-    def handle_cube_attachment(self, gripper_state_change: str): 
-        """
-        Handle cube attachment and detachment based on gripper state and proximity
-        - If gripper just closed, check proximity to determine which cube was grasped
-        - If gripper just opened, detach the currently attached cube
-        - Uses proximity threshold to determine if gripper is near a cube
-        """
-        # Closing Logic
-        if gripper_state_change == 'closed': 
-            # First Grasp "cube_2" (Red)
-            if self.grasp_sequence_count == 0: 
-                # Check if gripper is near cube_2
-                if self.is_gripper_near_cube('cube_2'):
-                    # Attach cube_2 and update count
-                    self.cube_attached = 'cube_2'
-                    self.grasp_sequence_count = 1
-                    print(f"🔴 CUBE_2 (Red) ATTACHED to gripper - Dynamic tracking enabled")
-                    self.get_logger().info("Cube_2 attached - enabling dynamic position tracking")
-
-            # Second Grasp "cube_3" (Green)
-            elif self.grasp_sequence_count == 1 and self.cube_attached is None:
-                # Check if gripper is near cube_3
-                if self.is_gripper_near_cube('cube_3'):
-                    self.cube_attached = 'cube_3'
-                    self.grasp_sequence_count = 2
-                    print(f"🟢 CUBE_3 (Green) ATTACHED to gripper - Dynamic tracking enabled")
-                    self.get_logger().info("Cube_3 attached - enabling dynamic position tracking")
-
-        # Opening Logic
-        elif gripper_state_change == 'open':
-            # Gripper just opened - detach currently attached cube
-            if self.cube_attached == 'cube_2':
-                print(f"🔴 CUBE_2 (Red) RELEASED - Dynamic tracking disabled")
-                self.get_logger().info("Cube_2 released - disabling dynamic position tracking")
-                self.cube_attached = None
-                
-            elif self.cube_attached == 'cube_3':
-                print(f"🟢 CUBE_3 (Green) RELEASED - Dynamic tracking disabled")
-                self.get_logger().info("Cube_3 released - disabling dynamic position tracking")
-                self.cube_attached = None
-        
-        else:
-            print(f"⚠️ Gripper opened but no cube was attached")
-
-    def is_gripper_near_cube(self, cube_name: str) -> bool: 
-        """ Helper function: Check if gripper is close enough to cube to grasp it"""
-        # Get current ee position
-        ee_pos = np.array([
-            self.current_eef_pose.pose.position.x,
-            self.current_eef_pose.pose.position.y,
-            self.current_eef_pose.pose.position.z
-        ])
-
-        # Get cube position -> self.cube_positions is a dict with cube names as keys and positions as values
-        cube_pos = self.cube_positions[cube_name]
-
-        # Calculate distance 
-        distance = np.linalg.norm(ee_pos - cube_pos)
-
-        # Return True if within proximity threshold, False otherwise
-        return distance < self.proximity_threshold
-
-
     def eef_pose_callback(self, msg: PoseStamped):
         """Callback for end-effector pose updates"""
         self.current_eef_pose = msg # Quaternion is in x, y, z, w format
@@ -801,19 +835,19 @@ class BCPolicyRunner(Node):
                 'cube_3': np.array([0.4306733310222626, -0.2792506217956543, 0.0203])
             },
             "custom_1": {
-                'cube_1': np.array([0.500, 0.000, 0.020]),
-                'cube_2': np.array([0.400, 0.200, 0.020]),
+                'cube_1': np.array([0.400, 0.200, 0.020]),
+                'cube_2': np.array([0.600, 0.300, 0.020]),
                 'cube_3': np.array([0.400, -0.200, 0.020])
             },
             "wide_spread": {
                 'cube_1': np.array([0.35, -0.25, 0.0203]),
                 'cube_2': np.array([0.65, 0.0, 0.0203]),
-                'cube_3': np.array([0.50, 0.15, 0.0203])
+                'cube_3': np.array([0.45, 0.25, 0.0203])
             },
             "tight_cluster": {
-                'cube_1': np.array([0.50, -0.1, 0.0203]),
+                'cube_1': np.array([0.50, -0.08, 0.0203]),
                 'cube_2': np.array([0.50, 0.0, 0.0203]),
-                'cube_3': np.array([0.50, 0.1, 0.0203])
+                'cube_3': np.array([0.50, 0.08, 0.0203])
             },
             "corner_formation": {
                 'cube_1': np.array([0.40, -0.20, 0.0203]),  # Bottom left
@@ -831,14 +865,14 @@ class BCPolicyRunner(Node):
                 'cube_3': np.array([0.50, 0.0, 0.0203])
             },
             "reach_challenge": {
-                'cube_1': np.array([0.50, -0.30, 0.0203]),  # Far left
-                'cube_2': np.array([0.50, 0.30, 0.0203]),   # Far right
-                'cube_3': np.array([0.65, 0.0, 0.0203])     # Center
+                'cube_1': np.array([0.35, -0.30, 0.0203]),  # Far left
+                'cube_2': np.array([0.65, 0.30, 0.0203]),   # Far right
+                'cube_3': np.array([0.50, 0.0, 0.0203])     # Center
             },
             "pick_place_demo": {
-                'cube_1': np.array([0.40, 0.0, 0.0203]),  # Pick source
-                'cube_2': np.array([0.50, 0.10, 0.0203]),   # Place target area
-                'cube_3': np.array([0.40, -0.20, 0.0203])   # Obstacle/intermediate
+                'cube_1': np.array([0.42, -0.18, 0.0203]),  # Pick source
+                'cube_2': np.array([0.58, 0.18, 0.0203]),   # Place target area
+                'cube_3': np.array([0.50, -0.05, 0.0203])   # Obstacle/intermediate
             },
             "sorting_task": {
                 'cube_1': np.array([0.38, -0.25, 0.0203]),  # Left bin
@@ -846,7 +880,7 @@ class BCPolicyRunner(Node):
                 'cube_3': np.array([0.62, 0.25, 0.0203])    # Right bin
             },
             "assembly_line": {
-                'cube_1': np.array([0.35, 0.0, 0.0203]),    # Input
+                'cube_1': np.array([0.40, 0.0, 0.0203]),    # Input
                 'cube_2': np.array([0.50, 0.0, 0.0203]),    # Processing
                 'cube_3': np.array([0.60, 0.0, 0.0203])     # Output
             },
@@ -967,23 +1001,23 @@ class BCPolicyRunner(Node):
         if pattern == "line":
             # Cubes in a line from left to right
             positions = {
-                'cube_1': np.array([0.45, -0.2, 0.0203]),
-                'cube_2': np.array([0.45, 0.0, 0.0203]),
-                'cube_3': np.array([0.45, 0.2, 0.0203])
+                'cube_1': np.array([0.5, -0.2, 0.0203]),
+                'cube_2': np.array([0.5, 0.0, 0.0203]),
+                'cube_3': np.array([0.5, 0.2, 0.0203])
             }
-        elif pattern == "triangle": # this is working
+        elif pattern == "triangle":
             # Cubes in a triangle formation
             positions = {
                 'cube_1': np.array([0.45, -0.1, 0.0203]),
                 'cube_2': np.array([0.45, 0.1, 0.0203]),
                 'cube_3': np.array([0.55, 0.0, 0.0203])
             }
-        elif pattern == "stack_ready": # this is working
+        elif pattern == "stack_ready":
             # Cubes positioned for easy stacking
             positions = {
-                'cube_1': np.array([0.5, 0.2, 0.0203]),      # Bottom (target)
-                'cube_2': np.array([0.5, 0.0, 0.0203]),   # Source 1
-                'cube_3': np.array([0.4, -0.2, 0.0203])     # Source 2
+                'cube_1': np.array([0.5, 0.0, 0.0203]),      # Bottom (target)
+                'cube_2': np.array([0.45, -0.15, 0.0203]),   # Source 1
+                'cube_3': np.array([0.55, 0.15, 0.0203])     # Source 2
             }
         else:
             print(f"❌ Unknown pattern: {pattern}")
@@ -1049,44 +1083,6 @@ class BCPolicyRunner(Node):
         print("💡 TIP: Use 'l' to see detailed descriptions of all presets")
         print()
 
-    def update_attached_cube_pose(self):
-        """
-        Update the position and orientation of the attached cube to match the end-effector
-        """
-
-        # Get current end effector pose
-        eef_pos = np.array([
-            self.current_eef_pose.pose.position.x,
-            self.current_eef_pose.pose.position.y,
-            self.current_eef_pose.pose.position.z
-        ])
-
-        # Get current end effector quaternion
-        eef_quat_ros = np.array([
-            self.current_eef_pose.pose.orientation.x,
-            self.current_eef_pose.pose.orientation.y,
-            self.current_eef_pose.pose.orientation.z,
-            self.current_eef_pose.pose.orientation.w
-        ])
-
-        # Convert to the IsaacLab quaternion format [w, x, y, z]
-        eef_quat_isaac = np.array([
-            eef_quat_ros[1],  
-            eef_quat_ros[2],  
-            eef_quat_ros[3],  
-            eef_quat_ros[0]   
-        ])
-
-        # Apply slight offset to the cube position
-        offset = np.array([0.0, 0.0, -0.015])  # Slightly below the gripper
-        attached_cube_pos = eef_pos + offset
-
-        # Update the attached cube's position and orientation
-        # E.g if cube_2 is attached -> self.cube_attached = 'cube_2'
-        self.cube_positions[self.cube_attached] = attached_cube_pos
-        self.cube_quaternions[self.cube_attached] = eef_quat_isaac
-
-
     def compute_object_observations(self) -> np.ndarray:
         """
         Compute 39D object observations matching IsaacLab structure:
@@ -1112,7 +1108,7 @@ class BCPolicyRunner(Node):
             self.current_eef_pose.pose.position.z
         ])
 
-        # Get cube positions and quaternions -> cube_2_pos, cube_3_pos are dynamic if attached
+        # Get cube positions and quaternions
         cube_1_pos = self.cube_positions['cube_1'] 
         cube_2_pos = self.cube_positions['cube_2']
         cube_3_pos = self.cube_positions['cube_3']
@@ -1499,19 +1495,16 @@ class BCPolicyRunner(Node):
             
             # Reset episode state
             self.policy.start_episode()
-            self.object_grasped = False
             self.gripper_goal_state = 'open'
             
             # RESET CUBE ATTACHMENT STATE
             self.grasp_sequence_count = 0
             self.cube_attached = None
             self.last_gripper_state = 'open'
+            self.gripper_state_stable_count = 0
             print("🔄 Cube attachment state reset")
             
             print("Robot moved to home position and episode state reset")
-
-            # Print the instructions after each reset: 
-            self.print_instructions()
             
             # Update status based on previous running state
             if was_running:
@@ -1546,7 +1539,7 @@ class BCPolicyRunner(Node):
             eef_quat_ros[3],  # qw
             eef_quat_ros[0],  # qx
             eef_quat_ros[1],  # qy
-            eef_quat_ros[2]   # z
+            eef_quat_ros[2]   # qz
         ], dtype=np.float32)
         
         # Extract gripper positions 
@@ -1557,18 +1550,17 @@ class BCPolicyRunner(Node):
         
         # Return dictionary with proper keys for robomimic policy (numpy arrays)
         obs_dict = {
-            'eef_pos': eef_pos,         # [3]
-            'eef_quat': eef_quat_sim,   # [4]
-            'gripper_pos': gripper_pos, # [2]
-            'object': object_state      # [39]
-                                        # Total: 48D observation vector
+            'eef_pos': eef_pos,
+            'eef_quat': eef_quat_sim,
+            'gripper_pos': gripper_pos,
+            'object': object_state
         }
         
         return obs_dict
     
     def log_observation_compact(self, obs_dict: Dict[str, np.ndarray], action_np: np.ndarray = None):
-        """Compact structured observation logging for full 48D vector with optional action logging and dynamic cube tracking"""
-        eef_pos = obs_dict['eef_pos']           #  3D
+        """Compact structured observation logging for full 48D vector with optional action logging"""
+        eef_pos = obs_dict['eef_pos']           # 3D
         eef_quat = obs_dict['eef_quat']         # 4D  
         gripper_pos = obs_dict['gripper_pos']   # 2D
         object_obs = obs_dict['object']         # 39D
@@ -1577,63 +1569,26 @@ class BCPolicyRunner(Node):
         total_size = len(eef_pos) + len(eef_quat) + len(gripper_pos) + len(object_obs)
         
         print(f"\n┌{'─'*100}┐")
+        print(f"│ STEP {self.step_count:<6} │ FULL 48D OBSERVATION VECTOR ({total_size} elements) │")
+        print(f"├{'─'*100}┤")
+        
+        # End-Effector Position (elements 0-2)
         print(f"│ EEF POS [0-2]   │ X:{eef_pos[0]:8.5f} │ Y:{eef_pos[1]:8.5f} │ Z:{eef_pos[2]:8.5f} │")
         
         # End-Effector Quaternion (elements 3-6)
-        print(f"│ EEF QUAT [3-6]  │ W:{eef_quat[0]:8.5f} │ X:{eef_quat[1]:8.5f} │ Y:{eef_quat[2]:8.5f} │ Z:{eef_quat[3]:8.5f} │")
+        print(f"│ EEF QUAT [3-6]  │ X:{eef_quat[0]:8.5f} │ Y:{eef_quat[1]:8.5f} │ Z:{eef_quat[2]:8.5f} │ W:{eef_quat[3]:8.5f} │")
         
         # Gripper Position (elements 7-8)
         gripper_width = abs(gripper_pos[0]) + abs(gripper_pos[1])
         gripper_state = "OPEN" if gripper_width > 0.04 else "CLOSED"
         print(f"│ GRIPPER [7-8]   │ F1:{gripper_pos[0]:8.5f} │ F2:{gripper_pos[1]:8.5f} │ Width:{gripper_width:7.4f} │ {gripper_state:<6} │")
-    
-        # DYNAMIC CUBE TRACKING SECTION
-        print(f"├{'─'*100}┤")
-        print(f"│ DYNAMIC CUBE TRACKING STATUS │")
-        print(f"├{'─'*100}┤")
-        
-        # Display current attachment status
-        if self.cube_attached is not None:
-            cube_colors = {'cube_2': '🔴 RED', 'cube_3': '🟢 GREEN'}
-            attached_color = cube_colors.get(self.cube_attached, f'🟡 {self.cube_attached.upper()}')
-            print(f"│ ATTACHED CUBE   │ {attached_color} CUBE ({self.cube_attached.upper()}) - Dynamic tracking ACTIVE │")
-            
-            # Show attachment position vs static position
-            static_pos = self.cube_positions[self.cube_attached]
-            print(f"│ CUBE POSITION   │ Current: [{static_pos[0]:6.3f}, {static_pos[1]:6.3f}, {static_pos[2]:6.3f}] (Dynamic) │")
-            
-            # Calculate how much the cube has moved from its original position
-            if hasattr(self, 'cube_original_positions') and self.cube_attached in self.cube_original_positions:
-                orig_pos = self.cube_original_positions[self.cube_attached]
-                movement = np.linalg.norm(static_pos - orig_pos)
-                print(f"│ CUBE MOVEMENT   │ Moved: {movement:.4f}m from original position │")
-        else:
-            print(f"│ ATTACHED CUBE   │ NONE - All cubes in static positions │")
-        
-        # Display grasp sequence progress
-        sequence_status = {
-            0: "🔄 READY - Awaiting first grasp (CUBE_2)",
-            1: "🔴 PHASE 1 - CUBE_2 grasped, awaiting placement and CUBE_3 grasp",
-            2: "🟢 PHASE 2 - CUBE_3 grasped, final stacking phase"
-        }
-        current_status = sequence_status.get(self.grasp_sequence_count, f"❓ UNKNOWN STATE ({self.grasp_sequence_count})")
-        print(f"│ GRASP SEQUENCE  │ {current_status} │")
-        
-        # Show proximity to unattached cubes
-        ee_pos_3d = np.array([eef_pos[0], eef_pos[1], eef_pos[2]])
-        cube_proximities = []
-        cube_names = ['cube_1', 'cube_2', 'cube_3']
-        cube_colors_simple = {'cube_1': '🔵', 'cube_2': '🔴', 'cube_3': '🟢'}
-        
-        for cube_name in cube_names:
-            if cube_name != self.cube_attached:  # Only show unattached cubes
-                cube_pos = self.cube_positions[cube_name]
-                distance = np.linalg.norm(ee_pos_3d - cube_pos)
-                proximity_status = "NEAR" if distance < self.proximity_threshold else "FAR"
-                cube_proximities.append(f"{cube_colors_simple[cube_name]}{cube_name.upper()}:{distance:.3f}m({proximity_status})")
-        
-        proximity_str = " │ ".join(cube_proximities)
-        print(f"│ CUBE PROXIMITY  │ {proximity_str} │")
+
+        # Add this after the gripper status line in log_observation_compact:
+
+        # Add attachment status display
+        attachment_status = f"ATTACHED: {self.cube_attached}" if self.cube_attached else "ATTACHED: None"
+        grasp_info = f"Grasp Seq: {self.grasp_sequence_count}/2"
+        print(f"│ ATTACHMENT      │ {attachment_status:<20} │ {grasp_info:<15} │ State: {self.last_gripper_state:<6} │")
         
         print(f"├{'─'*100}┤")
         print(f"│ OBJECT STATE [9-47] - 39 ELEMENTS │")
@@ -1642,25 +1597,22 @@ class BCPolicyRunner(Node):
         # Parse object observations (39D breakdown)
         idx = 0
         
-        # Cube 1 Position + Quaternion (elements 9-15) - with dynamic indicator
+        # Cube 1 Position + Quaternion (elements 9-15)
         cube1_pos = object_obs[idx:idx+3]
         cube1_quat = object_obs[idx+3:idx+7]
-        dynamic_indicator1 = " (DYNAMIC)" if self.cube_attached == 'cube_1' else " (STATIC)"
-        print(f"│ CUBE 1 [9-15]   │ Pos: [{cube1_pos[0]:6.3f}, {cube1_pos[1]:6.3f}, {cube1_pos[2]:6.3f}] │ Quat: [{cube1_quat[0]:5.2f}, {cube1_quat[1]:5.2f}, {cube1_quat[2]:5.2f}, {cube1_quat[3]:5.2f}]{dynamic_indicator1} │")
+        print(f"│ CUBE 1 [9-15]   │ Pos: [{cube1_pos[0]:6.3f}, {cube1_pos[1]:6.3f}, {cube1_pos[2]:6.3f}] │ Quat: [{cube1_quat[0]:5.2f}, {cube1_quat[1]:5.2f}, {cube1_quat[2]:5.2f}, {cube1_quat[3]:5.2f}] │")
         idx += 7
         
-        # Cube 2 Position + Quaternion (elements 16-22) - with dynamic indicator
+        # Cube 2 Position + Quaternion (elements 16-22)
         cube2_pos = object_obs[idx:idx+3]
         cube2_quat = object_obs[idx+3:idx+7]
-        dynamic_indicator2 = " (DYNAMIC)" if self.cube_attached == 'cube_2' else " (STATIC)"
-        print(f"│ CUBE 2 [16-22]  │ Pos: [{cube2_pos[0]:6.3f}, {cube2_pos[1]:6.3f}, {cube2_pos[2]:6.3f}] │ Quat: [{cube2_quat[0]:5.2f}, {cube2_quat[1]:5.2f}, {cube2_quat[2]:5.2f}, {cube2_quat[3]:5.2f}]{dynamic_indicator2} │")
+        print(f"│ CUBE 2 [16-22]  │ Pos: [{cube2_pos[0]:6.3f}, {cube2_pos[1]:6.3f}, {cube2_pos[2]:6.3f}] │ Quat: [{cube2_quat[0]:5.2f}, {cube2_quat[1]:5.2f}, {cube2_quat[2]:5.2f}, {cube2_quat[3]:5.2f}] │")
         idx += 7
         
-        # Cube 3 Position + Quaternion (elements 23-29) - with dynamic indicator
+        # Cube 3 Position + Quaternion (elements 23-29)
         cube3_pos = object_obs[idx:idx+3]
         cube3_quat = object_obs[idx+3:idx+7]
-        dynamic_indicator3 = " (DYNAMIC)" if self.cube_attached == 'cube_3' else " (STATIC)"
-        print(f"│ CUBE 3 [23-29]  │ Pos: [{cube3_pos[0]:6.3f}, {cube3_pos[1]:6.3f}, {cube3_pos[2]:6.3f}] │ Quat: [{cube3_quat[0]:5.2f}, {cube3_quat[1]:5.2f}, {cube3_quat[2]:5.2f}, {cube3_quat[3]:5.2f}]{dynamic_indicator3} │")
+        print(f"│ CUBE 3 [23-29]  │ Pos: [{cube3_pos[0]:6.3f}, {cube3_pos[1]:6.3f}, {cube3_pos[2]:6.3f}] │ Quat: [{cube3_quat[0]:5.2f}, {cube3_quat[1]:5.2f}, {cube3_quat[2]:5.2f}, {cube3_quat[3]:5.2f}] │")
         idx += 7
         
         # Relative positions EEF to Cubes (elements 30-38)
@@ -1671,18 +1623,9 @@ class BCPolicyRunner(Node):
             rel_pos = object_obs[idx:idx+3]
             distance = np.linalg.norm(rel_pos)
             element_range = f"[{30+i*3}-{32+i*3}]"
-            
-            # Add grasp indicators
-            cube_name = f"cube_{i+1}"
-            grasp_indicator = ""
-            if cube_name == self.cube_attached:
-                grasp_indicator = " (GRASPED)"
-            elif distance < self.proximity_threshold:
-                grasp_indicator = " (GRASPABLE)"
-            
-            print(f"│ EEF→CUBE{i+1} {element_range} │ Rel: [{rel_pos[0]:7.4f}, {rel_pos[1]:7.4f}, {rel_pos[2]:7.4f}] │ Dist: {distance:6.4f}m{grasp_indicator} │")
+            print(f"│ EEF→CUBE{i+1} {element_range} │ Rel: [{rel_pos[0]:7.4f}, {rel_pos[1]:7.4f}, {rel_pos[2]:7.4f}] │ Dist: {distance:6.4f}m │")
             idx += 3
-    
+        
         # Cube-to-Cube relative positions (elements 39-47)
         print(f"├{'─'*100}┤")
         print(f"│ CUBE TO CUBE RELATIVE POSITIONS │")
@@ -1691,22 +1634,19 @@ class BCPolicyRunner(Node):
         # Cube 1 to Cube 2 (elements 39-41)
         cube1_to_cube2 = object_obs[idx:idx+3]
         distance_1_2 = np.linalg.norm(cube1_to_cube2)
-        stack_indicator_12 = " (STACKED)" if distance_1_2 < 0.06 else ""
-        print(f"│ CUBE1→CUBE2 [39-41] │ Rel: [{cube1_to_cube2[0]:7.4f}, {cube1_to_cube2[1]:7.4f}, {cube1_to_cube2[2]:7.4f}] │ Dist: {distance_1_2:6.4f}m{stack_indicator_12} │")
+        print(f"│ CUBE1→CUBE2 [39-41] │ Rel: [{cube1_to_cube2[0]:7.4f}, {cube1_to_cube2[1]:7.4f}, {cube1_to_cube2[2]:7.4f}] │ Dist: {distance_1_2:6.4f}m │")
         idx += 3
         
         # Cube 2 to Cube 3 (elements 42-44)
         cube2_to_cube3 = object_obs[idx:idx+3]
         distance_2_3 = np.linalg.norm(cube2_to_cube3)
-        stack_indicator_23 = " (STACKED)" if distance_2_3 < 0.06 else ""
-        print(f"│ CUBE2→CUBE3 [42-44] │ Rel: [{cube2_to_cube3[0]:7.4f}, {cube2_to_cube3[1]:7.4f}, {cube2_to_cube3[2]:7.4f}] │ Dist: {distance_2_3:6.4f}m{stack_indicator_23} │")
+        print(f"│ CUBE2→CUBE3 [42-44] │ Rel: [{cube2_to_cube3[0]:7.4f}, {cube2_to_cube3[1]:7.4f}, {cube2_to_cube3[2]:7.4f}] │ Dist: {distance_2_3:6.4f}m │")
         idx += 3
         
         # Cube 1 to Cube 3 (elements 45-47)
         cube1_to_cube3 = object_obs[idx:idx+3]
         distance_1_3 = np.linalg.norm(cube1_to_cube3)
-        stack_indicator_13 = " (STACKED)" if distance_1_3 < 0.06 else ""
-        print(f"│ CUBE1→CUBE3 [45-47] │ Rel: [{cube1_to_cube3[0]:7.4f}, {cube1_to_cube3[1]:7.4f}, {cube1_to_cube3[2]:7.4f}] │ Dist: {distance_1_3:6.4f}m{stack_indicator_13} │")
+        print(f"│ CUBE1→CUBE3 [45-47] │ Rel: [{cube1_to_cube3[0]:7.4f}, {cube1_to_cube3[1]:7.4f}, {cube1_to_cube3[2]:7.4f}] │ Dist: {distance_1_3:6.4f}m │")
         idx += 3
         
         # Action logging section (if action is provided)
@@ -1730,34 +1670,12 @@ class BCPolicyRunner(Node):
             print(f"│ ACTION POS [0-2] │ X:{action_pos[0]:8.5f} │ Y:{action_pos[1]:8.5f} │ Z:{action_pos[2]:8.5f} │")
             print(f"│ ACTION QUAT[3-6] │ W:{action_quat[0]:8.5f} │ X:{action_quat[1]:8.5f} │ Y:{action_quat[2]:8.5f} │ Z:{action_quat[3]:8.5f} │")
             
-            # Gripper action analysis with dynamic context
+            # Gripper action analysis
             gripper_cmd_clamped = np.clip(gripper_action, -1.0, 1.0)
             gripper_pos_cmd = (gripper_cmd_clamped + 1.0) * 0.04  # Maps [-1,1] to [0, 0.08]
             gripper_state_cmd = "CLOSE" if gripper_action < 0 else "OPEN"
             
-            # Add context about what the gripper action might achieve
-            gripper_context = ""
-            if gripper_state_cmd == "CLOSE" and self.cube_attached is None:
-                # Check which cube is closest
-                closest_cube = None
-                min_distance = float('inf')
-                for cube_name in ['cube_2', 'cube_3']:  # Only check graspable cubes
-                    if cube_name != self.cube_attached:
-                        cube_pos = self.cube_positions[cube_name]
-                        distance = np.linalg.norm(ee_pos_3d - cube_pos)
-                        if distance < min_distance:
-                            min_distance = distance
-                            closest_cube = cube_name
-            
-                if closest_cube and min_distance < self.proximity_threshold:
-                    gripper_context = f" (ATTEMPT GRASP {closest_cube.upper()})"
-                else:
-                    gripper_context = " (NO CUBE IN RANGE)"
-                    
-            elif gripper_state_cmd == "OPEN" and self.cube_attached is not None:
-                gripper_context = f" (RELEASE {self.cube_attached.upper()})"
-            
-            print(f"│ ACTION GRIP [7]  │ Raw:{gripper_action:8.5f} │ Clamped:{gripper_cmd_clamped:8.5f} │ Pos:{gripper_pos_cmd:7.4f} │ Cmd:{gripper_state_cmd:<6}{gripper_context} │")
+            print(f"│ ACTION GRIP [7]  │ Raw:{gripper_action:8.5f} │ Clamped:{gripper_cmd_clamped:8.5f} │ Pos:{gripper_pos_cmd:7.4f} │ Cmd:{gripper_state_cmd:<6} │")
             
             # Action magnitude analysis
             pos_change_mag = np.linalg.norm(action_pos - eef_pos)
@@ -1765,31 +1683,16 @@ class BCPolicyRunner(Node):
             
             print(f"├{'─'*100}┤")
             print(f"│ ACTION ANALYSIS │ Pos Change: {pos_change_mag:6.4f}m │ Quat Diff: {quat_diff:6.4f} │ Gripper Δ: {gripper_action:7.4f} │")
-    
-        # Enhanced summary statistics with dynamic tracking info
+        
+        # Summary statistics
         print(f"├{'─'*100}┤")
         eef_to_cubes_min_dist = min([np.linalg.norm(object_obs[21+i*3:24+i*3]) for i in range(3)])
         cube_to_cube_min_dist = min([distance_1_2, distance_2_3, distance_1_3])
-        
-        # Count how many cubes are stacked
-        stacked_pairs = []
-        if distance_1_2 < 0.06:
-            stacked_pairs.append("1→2")
-        if distance_2_3 < 0.06:
-            stacked_pairs.append("2→3")
-        if distance_1_3 < 0.06:
-            stacked_pairs.append("1→3")
-        
-        stack_status = f" │ Stacked: {','.join(stacked_pairs) if stacked_pairs else 'NONE'}"
-        attachment_status = f" │ Attached: {self.cube_attached.upper() if self.cube_attached else 'NONE'}"
-        
-        print(f"│ SUMMARY         │ Total: {total_size} elements │ EEF height: {eef_pos[2]:6.4f}m │ Closest EEF→Cube: {eef_to_cubes_min_dist:6.4f}m │ Closest Cube→Cube: {cube_to_cube_min_dist:6.4f}m{stack_status}{attachment_status} │")
+        print(f"│ SUMMARY         │ Total: {total_size} elements │ EEF height: {eef_pos[2]:6.4f}m │ Closest EEF→Cube: {eef_to_cubes_min_dist:6.4f}m │ Closest Cube→Cube: {cube_to_cube_min_dist:6.4f}m │")
         print(f"└{'─'*100}┘")
-        
         # Increment step count
         self.step_count += 1
     
-    # Main control loop that handles both normal and replay modes
     def unified_control_loop(self):
         """Unified control loop with consistent timing for both normal and replay modes"""
         if self.shutdown_requested:
@@ -1810,28 +1713,21 @@ class BCPolicyRunner(Node):
         try:
             # STEP 1: Check for gripper state changes and handle cube attachment
             gripper_state_change = self.detect_gripper_state_change()
-            # If gripper_state_change is not None, handle cube attachment logic
             if gripper_state_change:
                 self.handle_cube_attachment(gripper_state_change)
-        
-            # STEP 2: Update cube pose if any cube is attached
-            if self.cube_attached is not None and self.current_eef_pose is not None:
-                self.update_attached_cube_pose()
+            
+            # STEP 2: Update attached cube pose if any cube is attached
+            self.update_attached_cube_pose()
             
             # STEP 3: Create observation for the policy (with updated cube poses)
             obs_dict = self.create_observation()
-
             if obs_dict is not None:
                 
                 # STEP 4: Run policy inference
                 action = self.policy(obs_dict)
-                # Convert action to numpy array if needed
                 action_np = action if isinstance(action, np.ndarray) else action.cpu().numpy()
 
-                # STEP 4.1 Add small noise to action for exploration
-                action_np += np.random.normal(0, 0.001, action_np.shape)
-
-                # STEP 5: Save observation for analysis
+                # STEP 5: Save observation for the normal policy inference
                 self.save_observation_to_csv(obs_dict, action_np)
                 
                 # STEP 6: Log observation and action together

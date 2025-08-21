@@ -158,34 +158,6 @@ class GripperControlMixin:
         except Exception as e:
             self.get_logger().error(f"Error in manual gripper control: {e}")
             print(f"Manual gripper control failed: {e}")
-
-    def detect_gripper_state_change(self): 
-        """
-        Detect reliable gripper state changes (open->closed or closed->open)
-        Returns 'closed', 'open', or None if no reliable change detected
-        """
-        if self.current_gripper_positions is None: 
-            return None
-
-        # Calculate the current gripper width
-        current_width = abs(self.current_gripper_positions[0]) + abs(self.current_gripper_positions[1])
-
-        # Determine the current state based on the width "Hysteresis logic"
-        if current_width < self.grasp_threshold:
-            current_state = 'closed'
-        elif current_width > self.release_threshold:
-            current_state = 'open'
-        else: 
-            # In the dead zone - maintain previous state to avoid oscillation
-            current_state = self.last_gripper_state
-
-        # If new state differs from previous state -> Update internal state and return new state
-        if current_state != self.last_gripper_state:
-            self.last_gripper_state = current_state
-            return current_state
-        
-        # If no change detected, return None
-        return None
     
     def handle_cube_attachment(self, gripper_state_change: str): 
         """

@@ -62,9 +62,9 @@ class BCPolicyRunner(Node, GripperControlMixin, CubeManagerMixin, ObservationMix
 
         # Object state storage
         self.cube_positions = {
-            'cube_1': np.array([0.4221598207950592, -0.1940348893404007, 0.0203000009059906]),
-            'cube_2': np.array([0.47585567831993103, -0.046219781041145325, 0.0203000009059906]),
-            'cube_3': np.array([0.4306733310222626, -0.2792506217956543, 0.0203000009059906])
+            'cube_1': np.array([0.400, -0.200, 0.0203]),
+            'cube_2': np.array([0.475, -0.046, 0.0203]),
+            'cube_3': np.array([0.430, -0.279, 0.0203])
         }
         
         # Cube orientations (quaternions) - w, x, y, z format "IsaacLab expects quaternions in [w, x, y, z] format"
@@ -77,7 +77,7 @@ class BCPolicyRunner(Node, GripperControlMixin, CubeManagerMixin, ObservationMix
         # Dynamic object state storage
         self.cube_attached = None # None, 'cube_2', 'cube_3'
         self.last_gripper_state = 'open' # Track gripper state changes
-        self.grasp_threshold = 0.06 # Width below which we consider the gripper "closed"
+        self.grasp_threshold = 0.055 # Width below which we consider the gripper "closed"
         self.release_threshold = 0.07 # Width above which we consider gripper "open"
         self.proximity_threshold = 0.05 # Distance threshold for grasp condition 
         self.grasp_sequence_count = 0 # 0: no grasps, 1: first grasp (cube_2) 2: second grasp (cube_3)
@@ -99,6 +99,10 @@ class BCPolicyRunner(Node, GripperControlMixin, CubeManagerMixin, ObservationMix
         self.is_running = False
         self.episode_active = False
         self.shutdown_requested = False
+
+        # Camera Flags
+        self.camera_cube_poses = {}
+        self.camera_cube_poses_received = False
         
         # Keyboard input handler
         self.keyboard = KeyboardInput()
@@ -113,15 +117,11 @@ class BCPolicyRunner(Node, GripperControlMixin, CubeManagerMixin, ObservationMix
         self.gripper_force = 40.0 # Default grasp force (N)
         self.gripper_epsilon_inner = 0.05
         self.gripper_epsilon_outer = 0.07
-        
         self.initialize_gripper_clients()
-
-        # Enhanced gripper state management (minimal addition)
         self.gripper_action_in_progress = False
         self.gripper_action_lock = threading.Lock()
         self.gripper_last_command_time = 0.0
         self.gripper_command_cooldown = 1.0  # 1 second between commands
-        # --- End Enhanced Gripper Control Initialization ---
         
         # Setup QoS (Quality of Service) profiles
         qos_profile = QoSProfile(
@@ -156,6 +156,9 @@ class BCPolicyRunner(Node, GripperControlMixin, CubeManagerMixin, ObservationMix
             callback_group=self.callback_group
         )
         
+        # Subscribe to cube poses from camera
+        self.setup_camera_subscribers(qos_profile, self.callback_group)
+
         # ------------------------------------------------------Publishers---------------------------------------------------------------
         self.pose_command_pub = self.create_publisher(
             Float64MultiArray,
@@ -192,7 +195,7 @@ class BCPolicyRunner(Node, GripperControlMixin, CubeManagerMixin, ObservationMix
         
         # Print initial instructions based on mode
         if self.testing_mode:
-            self.print_instructions_testing()  # CHANGE THIS LINE
+            self.print_instructions_testing()
         else:
             self.print_instructions()
 

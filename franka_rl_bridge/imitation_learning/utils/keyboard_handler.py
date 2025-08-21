@@ -35,6 +35,9 @@ class KeyboardHandlerMixin:
                 
             elif key == 'o':  # O - manual gripper toggle
                 self.toggle_gripper_manual()
+
+            elif key == 'v': # V - update cubes from camera
+                self.update_cubes_from_camera()
                 
             elif key == 'c':  # C - randomly spawn cubes
                 self.randomly_spawn_cubes()
@@ -173,6 +176,9 @@ class KeyboardHandlerMixin:
             elif key == 'c':  # C - randomly spawn cubes (config change, no trial increment)
                 self.randomly_spawn_cubes()
                 self.current_config_name = "Random"
+
+            elif key == 'v': # V - update cubes from vision system
+                self.update_cubes_from_camera()
 
             elif key == 'g':  # G - emergency gripper reset
                 self._emergency_gripper_reset()

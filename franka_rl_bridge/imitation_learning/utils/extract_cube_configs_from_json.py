@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Extract cube configurations from bc_stack_task_test_cases_extended.json 
-and generate the testing_configs dictionary for spawn_cubes_testing method.
+Extract cube configurations from JSON files and generate the testing_configs 
+dictionary for spawn_cubes_testing method.
 """
 
 import json
 import numpy as np
+import argparse
 from pathlib import Path
 
 def load_test_cases(json_file_path: str):
@@ -82,15 +83,41 @@ def print_summary(configurations):
         print(f"  [{key}] config_{i}: {config['description']}")
 
 def main():
-    """Main function"""
-    # Path to the JSON file
-    json_file_path = "bc_stack_task_test_cases_extended.json"
+    """Main function with command-line argument parsing"""
+    # Set up argument parser
+    parser = argparse.ArgumentParser(
+        description="Extract cube configurations from JSON files and generate Python code for cube_manager.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+    python3 extract_cube_configs_from_json.py --json bc_stack_task_test_cases_extended.json
+    python3 extract_cube_configs_from_json.py --json /path/to/my_configs.json
+    python3 extract_cube_configs_from_json.py -j custom_test_cases.json
+        """
+    )
+    
+    parser.add_argument(
+        "--json", "-j",
+        type=str,
+        required=True,
+        help="Path to the JSON file containing cube configurations"
+    )
+    
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose output"
+    )
+    
+    # Parse arguments
+    args = parser.parse_args()
+    json_file_path = args.json
     
     # Check if file exists
     if not Path(json_file_path).exists():
         print(f"❌ Error: File {json_file_path} not found!")
-        print("Please make sure the file is in the current directory.")
-        return
+        print("Please check the file path and try again.")
+        return 1
     
     try:
         # Load configurations
@@ -117,8 +144,35 @@ def main():
         print("\n✅ Code generation completed!")
         print("📋 Copy the generated code sections into your cube_manager.py file")
         
+        return 0
+        
+    except KeyError as e:
+        print(f"❌ Error: Invalid JSON structure. Missing key: {e}")
+        print("Expected JSON format:")
+        print("""
+{
+    "configurations": [
+        {
+            "description": "Configuration description",
+            "poses": [
+                {"pos": [x, y, z]},
+                {"pos": [x, y, z]},
+                {"pos": [x, y, z]}
+            ]
+        }
+    ]
+}
+        """)
+        return 1
+        
+    except json.JSONDecodeError as e:
+        print(f"❌ Error: Invalid JSON format in {json_file_path}")
+        print(f"JSON Error: {e}")
+        return 1
+        
     except Exception as e:
         print(f"❌ Error processing file: {e}")
+        return 1
 
 if __name__ == "__main__":
-    main()
+    exit(main())

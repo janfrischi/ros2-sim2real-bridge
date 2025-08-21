@@ -32,7 +32,7 @@ class PolicyControlMixin:
         )
         return policy, ckpt_dict
 
-    # Unified action execution method for both normal and replay modes
+
     def execute_action(self, action_np: np.ndarray):
         """Unified action execution for both normal and replay modes"""
         try:
@@ -64,7 +64,7 @@ class PolicyControlMixin:
                 self.get_logger().warn("Invalid quaternion, skipping action execution")
                 return
             
-            # --- UNIFIED Gripper Control Logic ---
+            # --- Gripper Control Logic ---
             # Clamp gripper command to expected range [-1, 1]
             gripper_command = np.clip(gripper_command, -1.0, 1.0)
             
@@ -75,6 +75,95 @@ class PolicyControlMixin:
                     self.open_gripper()
                 elif desired_gripper_state == 'closed':
                     self.close_gripper()
+            
+            # Create cartesian pose command: [x, y, z, qx, qy, qz, qw]
+            cartesian_pose = np.concatenate([
+                position,         # [x, y, z]
+                quaternion_ros    # [qx, qy, qz, qw]
+            ])
+            
+            # Publish cartesian pose commands to the controller
+            pose_msg = Float64MultiArray()
+            pose_msg.data = cartesian_pose.tolist()
+            self.pose_command_pub.publish(pose_msg)
+
+            self.get_logger().debug(f"Action executed: pos={position}, quat={quaternion_ros}, gripper={gripper_command}")
+            
+        except Exception as e:
+            self.get_logger().error(f"Error executing action: {e}")
+
+    def execute_action_safety_filter(self, action_np: np.ndarray):
+        """Unified action execution for both normal and replay modes"""
+        try:
+            # Ensure it's a 1D array
+            if action_np.ndim > 1:
+                action_np = action_np.squeeze()
+            
+            # Interpret action - 7D end-effector pose + 1D gripper
+            eef_pose = action_np[:7]  # [x, y, z, qw, qx, qy, qz] - IsaacLab format
+            gripper_command = action_np[7]  # Gripper command
+                
+            # Extract position and quaternion from pose
+            position = eef_pose[:3]  # [x, y, z]
+            quaternion_sim = eef_pose[3:]  # [qw, qx, qy, qz] - IsaacLab format
+            
+            # Convert from IsaacLab [qw, qx, qy, qz] to ROS [qx, qy, qz, qw]
+            quaternion_ros = np.array([
+                quaternion_sim[1],  # qx
+                quaternion_sim[2],  # qy
+                quaternion_sim[3],  # qz
+                quaternion_sim[0]   # qw
+            ])
+            
+            # Normalize quaternion to ensure it's valid
+            quat_norm = np.linalg.norm(quaternion_ros)
+            if quat_norm > 0:
+                quaternion_ros = quaternion_ros / quat_norm
+            else:
+                self.get_logger().warn("Invalid quaternion, skipping action execution")
+                return
+            
+            # --- Gripper Control Logic with Safety Filter for Opening Only ---
+            # Clamp gripper command to expected range [-1, 1]
+            gripper_command = np.clip(gripper_command, -1.0, 1.0)
+            
+            # Initialize gripper command history if not exists
+            if not hasattr(self, 'gripper_command_history'):
+                self.gripper_command_history = []
+            
+            # Add current command to history
+            self.gripper_command_history.append(gripper_command)
+            
+            # Keep only last 2 commands
+            if len(self.gripper_command_history) > 2:
+                self.gripper_command_history.pop(0)
+            
+            # Determine desired gripper state based on current command
+            desired_gripper_state = 'closed' if gripper_command < 0 else 'open'
+            
+            # Apply safety filter logic
+            if desired_gripper_state != self.gripper_goal_state:
+                if desired_gripper_state == 'open':
+                    # SAFETY FILTER: Only apply filtering for gripper opening
+                    if len(self.gripper_command_history) >= 2:
+                        # Check if last 2 commands both indicate opening
+                        last_two_states = []
+                        for cmd in self.gripper_command_history:
+                            last_two_states.append('closed' if cmd < 0 else 'open')
+                        
+                        # Only open if both recent commands indicate opening
+                        if all(state == 'open' for state in last_two_states):
+                            self.open_gripper()
+                            self.get_logger().debug(f"Gripper OPEN triggered after 2 consistent commands: {self.gripper_command_history}")
+                        else:
+                            self.get_logger().debug(f"Gripper opening filtered - inconsistent commands: {self.gripper_command_history} -> {last_two_states}")
+                    else:
+                        self.get_logger().debug(f"Collecting gripper commands for opening: {len(self.gripper_command_history)}/2")
+                        
+                elif desired_gripper_state == 'closed':
+                    # NO FILTER: Close immediately (original behavior)
+                    self.close_gripper()
+                    self.get_logger().debug(f"Gripper CLOSE triggered immediately: {gripper_command}")
             
             # Create cartesian pose command: [x, y, z, qx, qy, qz, qw]
             cartesian_pose = np.concatenate([
@@ -175,6 +264,10 @@ class PolicyControlMixin:
                 self.update_status(f"Status: HOMED - Trial {self.trial_id} ready - Press SPACE to resume, S to stop, Q to quit")
             else:
                 self.update_status("Status: HOMED - Press SPACE to start, Q to quit")
+                
+            # Reset camera detection state
+            if hasattr(self, 'reset_camera_detection'):
+                self.reset_camera_detection()
                 
         except Exception as e:
             self.get_logger().error(f"Error during home reset: {e}")

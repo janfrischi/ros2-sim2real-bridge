@@ -56,13 +56,31 @@ class ObservationsPlotter:
             y=y,
             z=z,
             mode='lines+markers',
-            line=dict(color='blue', width=4),
-            marker=dict(size=3, color='blue'),
+            line=dict(
+                color=self.data['timestamp'],
+                colorscale='Viridis',
+                width=4,
+                colorbar=dict(
+                    title="Time (s)",
+                    x=-0.15,  # Position colorbar on the left side
+                    xanchor="right",
+                    thickness=15,
+                    len=0.8,
+                    yanchor="middle"
+                )
+            ),
+            marker=dict(
+                size=3,
+                color=self.data['timestamp'],
+                colorscale='Viridis',
+                opacity=0.7
+            ),
             name='EEF Trajectory (Smoothed)',
             hovertemplate='<b>EEF Position</b><br>' +
                          'X: %{x:.4f} m<br>' +
                          'Y: %{y:.4f} m<br>' +
                          'Z: %{z:.4f} m<br>' +
+                         'Time: %{marker.color:.2f} s<br>' +
                          '<extra></extra>'
         ))
         fig.add_trace(go.Scatter3d(
@@ -96,6 +114,22 @@ class ObservationsPlotter:
             fig.update_layout(title_text=self.config_description)
         else:
             fig.update_layout(title_text="End-Effector Trajectory")
+        
+        # Update layout to accommodate left-side colorbar
+        fig.update_layout(
+            scene=dict(
+                xaxis_title='X (m)',
+                yaxis_title='Y (m)',
+                zaxis_title='Z (m)',
+                aspectmode='data',
+                camera=dict(
+                    eye=dict(x=1.5, y=1.5, z=1.5)
+                )
+            ),
+            height=800,
+            margin=dict(l=100, r=50, t=50, b=50)  # Increase left margin for colorbar
+        )
+        
         return fig
 
     def create_position_time_plot(self, smooth_window=5) -> go.Figure:
@@ -249,8 +283,16 @@ class ObservationsPlotter:
             y=smooth_series(self.data['eef_pos_y'], window=smooth_window),
             z=smooth_series(self.data['eef_pos_z'], window=smooth_window),
             mode='lines+markers',
-            line=dict(color='blue', width=3),
-            marker=dict(size=2, color='blue'),
+            line=dict(
+                color=self.data['timestamp'], 
+                colorscale='Viridis', 
+                width=3
+            ),
+            marker=dict(
+                size=2, 
+                color=self.data['timestamp'], 
+                colorscale='Viridis'
+            ),
             name='EEF Trajectory (Smoothed)'
         ), row=1, col=2)
         # Quaternion vs time

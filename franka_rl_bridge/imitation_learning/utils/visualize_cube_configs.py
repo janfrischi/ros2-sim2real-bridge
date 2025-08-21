@@ -79,6 +79,29 @@ def plot_cube_configurations(configurations, save_path=None):
         ax.set_ylim(workspace_y[0] - 0.05, workspace_y[1] + 0.05)
         ax.set_aspect('equal')
         
+        # Add custom grid with 0.05 spacing
+        grid_spacing = 0.05
+        x_min, x_max = ax.get_xlim()
+        y_min, y_max = ax.get_ylim()
+        
+        # Create grid lines
+        x_grid = np.arange(np.floor(x_min/grid_spacing)*grid_spacing, 
+                          np.ceil(x_max/grid_spacing)*grid_spacing + grid_spacing, 
+                          grid_spacing)
+        y_grid = np.arange(np.floor(y_min/grid_spacing)*grid_spacing, 
+                          np.ceil(y_max/grid_spacing)*grid_spacing + grid_spacing, 
+                          grid_spacing)
+        
+        # Draw vertical grid lines
+        for x in x_grid:
+            if x_min <= x <= x_max:
+                ax.axvline(x, color='#BDC3C7', alpha=0.4, linewidth=0.5, zorder=1)
+        
+        # Draw horizontal grid lines
+        for y in y_grid:
+            if y_min <= y <= y_max:
+                ax.axhline(y, color='#BDC3C7', alpha=0.4, linewidth=0.5, zorder=1)
+        
         # Shorten the title: just show the config number (e.g., "#1")
         short_title = f"#{idx+1}"
         ax.set_title(short_title, fontsize=11, fontweight='bold', pad=8)
@@ -87,8 +110,8 @@ def plot_cube_configurations(configurations, save_path=None):
         ax.set_xlabel('X (m)', fontsize=8)
         ax.set_ylabel('Y (m)', fontsize=8)
         
-        # Clean grid
-        ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+        # Remove the default grid since we're using custom grid
+        # ax.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)  # Comment out this line
         ax.tick_params(labelsize=7)
         
         # Clean axes
@@ -112,9 +135,19 @@ def plot_cube_configurations(configurations, save_path=None):
     plt.subplots_adjust(top=0.88, hspace=0.5, wspace=0.3)
     
     if save_path:
-        plt.savefig(save_path, dpi=600, bbox_inches='tight', 
-                   facecolor='white', edgecolor='none')
-        print(f"✅ Plot saved to {save_path}")
+        # Get file extension to determine format
+        save_path = Path(save_path)
+        
+        # Save as vector format (SVG) if specified, otherwise PNG
+        if save_path.suffix.lower() == '.svg':
+            plt.savefig(save_path, format='svg', bbox_inches='tight', 
+                       facecolor='white', edgecolor='none')
+            print(f"✅ Vector graphic saved to {save_path}")
+        else:
+            # Default PNG with high DPI
+            plt.savefig(save_path, dpi=600, bbox_inches='tight', 
+                       facecolor='white', edgecolor='none')
+            print(f"✅ Plot saved to {save_path}")
     
     plt.show()
 
@@ -163,8 +196,8 @@ def main():
                        default="bc_stack_task_test_cases_extended.json",
                        help="Path to JSON configuration file")
     parser.add_argument("--output", type=str, 
-                       default="cube_configurations_visualization.png",
-                       help="Output path for the visualization")
+                       default="cube_configurations_visualization.svg",
+                       help="Output path for the visualization (.svg for vector, .png for raster)")
     
     args = parser.parse_args()
     json_file_path = args.json

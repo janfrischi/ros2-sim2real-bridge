@@ -478,23 +478,85 @@ class EEFTrajectoryPlotter:
         )
         
         return fig
-
+    
+    def create_gripper_plot(self):
+        """Create gripper command vs time plot"""
+        if self.data is None:
+            return None
+    
+        # Check if action_gripper column exists
+        if 'action_gripper' not in self.data.columns:
+            print("⚠️ No action_gripper column found in data")
+            return None
+        
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatter(
+            x=self.data['time_seconds'],
+            y=self.data['action_gripper'],
+            mode='lines+markers',
+            name='Gripper Command',
+            line=dict(color='orange', width=3),
+            marker=dict(size=4, color='orange'),
+            hovertemplate='<b>Gripper Command</b><br>' +
+                         'Time: %{x:.2f} s<br>' +
+                         'Command: %{y:.3f}<br>' +
+                         '<extra></extra>'
+        ))
+        
+        # Add horizontal reference lines for open/closed states
+        fig.add_hline(
+            y=1.0,
+            line_dash="dash",
+            line_color="green",
+            annotation_text="Open (1.0)",
+            annotation_position="top right"
+        )
+        
+        fig.add_hline(
+            y=-1.0,
+            line_dash="dash", 
+            line_color="red",
+            annotation_text="Closed (-1.0)",
+            annotation_position="bottom right"
+        )
+        
+        fig.add_hline(
+            y=0.0,
+            line_dash="dot",
+            line_color="gray",
+            annotation_text="Neutral (0.0)",
+            annotation_position="bottom left"  # Changed from "middle right" to "bottom left"
+        )
+        
+        fig.update_layout(
+            title='Gripper Command vs Time',
+            xaxis_title='Time (s)',
+            yaxis_title='Gripper Command',
+            height=400,
+            showlegend=True,
+            hovermode='x unified',
+            yaxis=dict(range=[-1.2, 1.2])  # Set y-axis range for better visibility
+        )
+        
+        return fig
+    
     def create_combined_dashboard(self):
         """Create a combined dashboard with all plots"""
         if self.data is None:
             return None
         
-        # Create subplots with better proportions for 3D plot
+        # Create subplots with 2x3 layout to include gripper plot
         fig = make_subplots(
-            rows=2, cols=2,
-            subplot_titles=('EE-Position vs Time', '3D Trajectory with Coordinate Frame', 
-                          'EE-Quaternion vs Time', 'Manipulability Index vs Time'),  # Changed title
-            specs=[[{'type': 'scatter'}, {'type': 'scatter3d'}],
-                   [{'type': 'scatter'}, {'type': 'scatter'}]],
-            vertical_spacing=0.15,
-            horizontal_spacing=0.05,
-            column_widths=[0.45, 0.55],  # More space for 3D plot
-            row_heights=[0.55, 0.45]     # More space for top row
+            rows=2, cols=3,
+            subplot_titles=('EE-Position vs Time', '3D Trajectory with Coordinate Frame', 'Gripper Command vs Time',
+                          'EE-Quaternion vs Time', 'Manipulability Index vs Time', 'Trajectory Statistics'),
+            specs=[[{'type': 'scatter'}, {'type': 'scatter3d'}, {'type': 'scatter'}],
+                   [{'type': 'scatter'}, {'type': 'scatter'}, {'type': 'scatter'}]],
+            vertical_spacing=0.12,
+            horizontal_spacing=0.08,
+            column_widths=[0.33, 0.34, 0.33],
+            row_heights=[0.55, 0.45]
         )
         
         # Add position vs time (row 1, col 1)
@@ -518,7 +580,7 @@ class EEFTrajectoryPlotter:
             'z': self.data['eef_pos_z'].max() - self.data['eef_pos_z'].min()
         }
         max_range = max(pos_ranges.values())
-        axis_length = max(0.08, min(0.25, max_range * 0.4))  # 40% of trajectory range
+        axis_length = max(0.08, min(0.25, max_range * 0.4))
 
         # Add coordinate frame to 3D plot (row 1, col 2)
         origin = [0, 0, 0]
@@ -529,7 +591,7 @@ class EEFTrajectoryPlotter:
             y=[origin[1], origin[1]],
             z=[origin[2], origin[2]],
             mode='lines',
-            line=dict(color='red', width=8),  # Thicker lines
+            line=dict(color='red', width=8),
             name='X-axis',
             showlegend=False
         ), row=1, col=2)
@@ -540,7 +602,7 @@ class EEFTrajectoryPlotter:
             y=[origin[1], origin[1] + axis_length],
             z=[origin[2], origin[2]],
             mode='lines',
-            line=dict(color='green', width=8),  # Thicker lines
+            line=dict(color='green', width=8),
             name='Y-axis',
             showlegend=False
         ), row=1, col=2)
@@ -551,7 +613,7 @@ class EEFTrajectoryPlotter:
             y=[origin[1], origin[1]],
             z=[origin[2], origin[2] + axis_length],
             mode='lines',
-            line=dict(color='blue', width=8),  # Thicker lines
+            line=dict(color='blue', width=8),
             name='Z-axis',
             showlegend=False
         ), row=1, col=2)
@@ -562,7 +624,7 @@ class EEFTrajectoryPlotter:
             y=[origin[1]],
             z=[origin[2]],
             mode='markers',
-            marker=dict(size=10, color='black', symbol='circle'),  # Larger marker
+            marker=dict(size=10, color='black', symbol='circle'),
             name='Origin',
             showlegend=False
         ), row=1, col=2)
@@ -579,6 +641,51 @@ class EEFTrajectoryPlotter:
             showlegend=False
         ), row=1, col=2)
         
+        # Add gripper command vs time (row 1, col 3)
+        if 'action_gripper' in self.data.columns:
+            fig.add_trace(go.Scatter(
+                x=self.data['time_seconds'],
+                y=self.data['action_gripper'],
+                mode='lines+markers',
+                name='Gripper Cmd',
+                line=dict(color='orange', width=2),
+                marker=dict(size=3, color='orange'),
+                legendgroup='gripper'
+            ), row=1, col=3)
+            
+            # Add reference lines for gripper states using scatter traces
+            time_range = [self.data['time_seconds'].min(), self.data['time_seconds'].max()]
+            
+            # Open line (green, y=1.0)
+            fig.add_trace(go.Scatter(
+                x=time_range,
+                y=[1.0, 1.0],
+                mode='lines',
+                name='Open (1.0)',
+                line=dict(color='green', width=2, dash='dash'),
+                showlegend=False
+            ), row=1, col=3)
+            
+            # Closed line (red, y=-1.0)
+            fig.add_trace(go.Scatter(
+                x=time_range,
+                y=[-1.0, -1.0],
+                mode='lines',
+                name='Closed (-1.0)',
+                line=dict(color='red', width=2, dash='dash'),
+                showlegend=False
+            ), row=1, col=3)
+            
+            # Neutral line (gray, y=0.0)
+            fig.add_trace(go.Scatter(
+                x=time_range,
+                y=[0.0, 0.0],
+                mode='lines',
+                name='Neutral (0.0)',
+                line=dict(color='gray', width=2, dash='dot'),
+                showlegend=False
+            ), row=1, col=3)
+    
         # Add quaternion vs time (row 2, col 1)
         quat_colors = ['red', 'green', 'blue', 'orange']
         for i, comp in enumerate(['x', 'y', 'z', 'w']):
@@ -593,7 +700,7 @@ class EEFTrajectoryPlotter:
                     legendgroup='quaternion'
                 ), row=2, col=1)
 
-    # Add manipulability index vs time (row 2, col 2) - REPLACED VELOCITY
+        # Add manipulability index vs time (row 2, col 2)
         if 'manipulability_index' in self.data.columns:
             fig.add_trace(go.Scatter(
                 x=self.data['time_seconds'],
@@ -604,10 +711,11 @@ class EEFTrajectoryPlotter:
                 legendgroup='manipulability'
             ), row=2, col=2)
             
-            # FIXED: Add mean line using scatter trace instead of add_hline
+            # Add mean line using scatter trace
             mean_value = self.data['manipulability_index'].mean()
+            time_range = [self.data['time_seconds'].min(), self.data['time_seconds'].max()]
             fig.add_trace(go.Scatter(
-                x=[self.data['time_seconds'].min(), self.data['time_seconds'].max()],
+                x=time_range,
                 y=[mean_value, mean_value],
                 mode='lines',
                 name=f'Mean ({mean_value:.6f})',
@@ -624,17 +732,17 @@ class EEFTrajectoryPlotter:
             title_text += f" - {self.config_description}"
         
         fig.update_layout(
-            height=900,  # Increased height
+            height=900,
             title_text=title_text,
             showlegend=True
         )
         
-        # REMOVED: The problematic fig.update_scenes() call
-        # 3D scene configuration is handled automatically by plotly subplots
-        
-        # Update axis labels for 2D plots only
+        # Update axis labels for 2D plots
         fig.update_xaxes(title_text="Time (s)", row=1, col=1)  # Position plot
         fig.update_yaxes(title_text="Position (m)", row=1, col=1)
+        
+        fig.update_xaxes(title_text="Time (s)", row=1, col=3)  # Gripper plot  
+        fig.update_yaxes(title_text="Gripper Command", row=1, col=3)
         
         fig.update_xaxes(title_text="Time (s)", row=2, col=1)  # Quaternion plot
         fig.update_yaxes(title_text="Quaternion", row=2, col=1)
@@ -683,6 +791,24 @@ class EEFTrajectoryPlotter:
             print(f"  Magnitude mean: {magnitude.mean():.6f}")
             print(f"  Magnitude std: {magnitude.std():.6f}")
         
+        # Gripper statistics
+        if 'action_gripper' in self.data.columns:
+            gripper_data = self.data['action_gripper']
+            print(f"\nGripper Command Statistics:")
+            print(f"  Range: [{gripper_data.min():.3f}, {gripper_data.max():.3f}]")
+            print(f"  Mean: {gripper_data.mean():.3f}")
+            print(f"  Std: {gripper_data.std():.3f}")
+            
+            # Count command states
+            open_commands = (gripper_data > 0.5).sum()
+            closed_commands = (gripper_data < -0.5).sum()
+            neutral_commands = ((gripper_data >= -0.5) & (gripper_data <= 0.5)).sum()
+            
+            print(f"  Command Distribution:")
+            print(f"    Open (>0.5): {open_commands} ({open_commands/len(gripper_data)*100:.1f}%)")
+            print(f"    Closed (<-0.5): {closed_commands} ({closed_commands/len(gripper_data)*100:.1f}%)")
+            print(f"    Neutral (-0.5 to 0.5): {neutral_commands} ({neutral_commands/len(gripper_data)*100:.1f}%)")
+        
         # Manipulability statistics
         if 'manipulability_index' in self.data.columns:
             manip_data = self.data['manipulability_index']
@@ -694,6 +820,7 @@ class EEFTrajectoryPlotter:
         
         print("="*70)
     
+    # Update the plot_all method to include gripper plot
     def plot_all(self, show_stats=True, save_html=None, show_plots=True):
         """Plot all visualizations"""
         if not self.load_data():
@@ -717,11 +844,15 @@ class EEFTrajectoryPlotter:
         print("  - Quaternion vs Time") 
         quat_fig = self.create_quaternion_plot()
         
-        # 4. Manipulability Index Plot (replaced velocity)
+        # 4. Gripper Command Plot (NEW)
+        print("  - Gripper Command")
+        gripper_fig = self.create_gripper_plot()
+        
+        # 5. Manipulability Index Plot
         print("  - Manipulability Index")
         manip_fig = self.create_manipulability_plot()
         
-        # 5. Combined Dashboard
+        # 6. Combined Dashboard
         print("  - Combined Dashboard")
         dashboard_fig = self.create_combined_dashboard()
         
@@ -742,6 +873,10 @@ class EEFTrajectoryPlotter:
                 quat_fig.write_html(f"{base_name}_quaternion.html")
                 print(f"  - {base_name}_quaternion.html")
             
+            if gripper_fig:
+                gripper_fig.write_html(f"{base_name}_gripper.html")
+                print(f"  - {base_name}_gripper.html")
+            
             if manip_fig:
                 manip_fig.write_html(f"{base_name}_manipulability.html")
                 print(f"  - {base_name}_manipulability.html")
@@ -749,7 +884,7 @@ class EEFTrajectoryPlotter:
             if dashboard_fig:
                 dashboard_fig.write_html(f"{base_name}_dashboard.html")
                 print(f"  - {base_name}_dashboard.html")
-        
+    
         # Show plots
         if show_plots:
             print(f"\n🖥️ Displaying plots...")
@@ -762,10 +897,14 @@ class EEFTrajectoryPlotter:
                 print("  - Opening 3D Trajectory")
                 traj_fig.show()
             
+            if gripper_fig:
+                print("  - Opening Gripper Command")
+                gripper_fig.show()
+            
             if manip_fig:
                 print("  - Opening Manipulability Index")
                 manip_fig.show()
-    
+
         return True
 
 

@@ -232,7 +232,7 @@ if __name__ == "__main__":
     Kc = np.diag([1200, 1200, 1200, 80, 80, 80])  # N/m and Nm/rad
     print(f"Using Cartesian stiffness: diag{np.diag(Kc).tolist()}")
     
-    # Example Jacobian at a typical pose (6×7)
+    # Example Jacobian at a typical pose (6×7) @home position
     J = np.array([
         [0.00245166, -0.0653364,  -0.001655,   0.395646,    0.00190744,  0.213878,     -4.50823e-19],
         [0.468204,    0.0287576,   0.45419,    0.0237196,   0.114093,   -0.000424604, -9.71871e-19],

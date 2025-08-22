@@ -112,14 +112,14 @@ class RobotStateMixin:
         self.cube_subscriber = self.create_subscription(
             PoseStamped,
             '/perception/object_pose',
-            self.unified_cube_pose_callback,
+            self.cube_pose_callback,
             qos_profile,
             callback_group=callback_group
         )
         
         self.get_logger().info("Camera cube pose subscriber initialized for /perception/object_pose")
 
-    def unified_cube_pose_callback(self, msg):
+    def cube_pose_callback(self, msg):
         """Callback for unified cube pose messages from /perception/object_pose"""
         try:
             # Extract cube identity from frame_id

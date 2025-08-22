@@ -98,6 +98,7 @@ class BCPolicyRunner(Node, GripperControlMixin, CubeManagerMixin, ObservationMix
         # Control flags
         self.is_running = False
         self.episode_active = False
+        self.policy_running = False
         self.shutdown_requested = False
 
         # Camera Flags
@@ -172,14 +173,7 @@ class BCPolicyRunner(Node, GripperControlMixin, CubeManagerMixin, ObservationMix
             qos_profile
         )
 
-        # Debug observation publisher
-        self.observation_debug_pub = self.create_publisher(
-            Float64MultiArray,
-            '/bc_policy/observation_debug',
-            qos_profile
-        )
-        
-        # --------------------------------- Single timer for both normal and replay modes ---------------------------------
+        # --------------------------------- ROS2 Timer for the Control Loop ---------------------------------
         self.control_timer = self.create_timer(
             1.0 / self.control_frequency,  # Period = 1/20Hz = 0.05 seconds
             self.control_loop, 
@@ -187,7 +181,7 @@ class BCPolicyRunner(Node, GripperControlMixin, CubeManagerMixin, ObservationMix
             clock=rclpy.clock.Clock(clock_type=rclpy.clock.ClockType.STEADY_TIME)
         )
         
-        # Keyboard input timer (check for keypress every 50ms)
+        # --------------------------------- Keyboard Input Timer for Policy Testing and Normal Mode ---------
         if self.testing_mode:
             self.keyboard_timer = self.create_timer(0.05, self.check_keyboard_input_testing)  # ADD THIS
         else:
@@ -199,10 +193,8 @@ class BCPolicyRunner(Node, GripperControlMixin, CubeManagerMixin, ObservationMix
         else:
             self.print_instructions()
 
-        # Policy running state
-        self.policy_running = False
-
-    
+        
+    # -------------------------------Main Control Loop Logic-------------------------------------------------
     def control_loop(self):
         """Main control loop for normal mode"""
         if self.shutdown_requested:
@@ -229,7 +221,7 @@ class BCPolicyRunner(Node, GripperControlMixin, CubeManagerMixin, ObservationMix
             # STEP 3: Calculate manipulability index
             manipulability_index = self.calculate_manipulability_index()
 
-            # STEP 4: Create observation for the policy (with updated cube poses)
+            # STEP 4: Create observation for the policy
             obs_dict = self.create_observation()
 
             if obs_dict is not None:

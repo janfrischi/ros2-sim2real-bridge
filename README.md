@@ -1,6 +1,11 @@
 # franka_rl_bridge
 
-`franka_rl_bridge` is a ROS 2 package designed to bridge Franka Emika robot state and control interfaces with reinforcement learning (RL) workflows. It provides utilities for listening to joint states, running policy inference, and executing RL policies on the robot or in simulation. The package is intended for research and development in robot learning, enabling seamless integration between ROS 2 and RL pipelines.
+`franka_rl_bridge` is a modular ROS 2 (Humble) package that unifies Franka Emika Panda robot state & control interfaces with modern Imitation and Reinforcement learning workflows. It standardizes observations (EEF, objects, gripper, kinematics) and action mapping across simulation and real hardware, enabling fast policy deployment with minimal code changes. A mixin-based utility layer (imitation_learning/utils) encapsulates gripper control, object (cube) management, kinematics/Jacobian access, keyboard interaction, policy lifecycle, and structured observation building. The package emphasizes: 
+- Sim2Real consistency (identical observation & action schemas) 
+- Safe, rate-controlled policy execution 
+- Deterministic or stochastic inference modes 
+- Rapid iteration via modular mixins 
+- Lightweight logging & plotting for evaluation 
 
 ## Project Structure
 

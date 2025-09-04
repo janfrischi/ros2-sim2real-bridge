@@ -5,11 +5,40 @@
 ## Project Structure
 
 - `franka_rl_bridge/`
-  - `__init__.py`: Package marker file.
-  - `joint_state_listener.py`: Node/script to subscribe to joint states and publish or log them for RL use.
-  - `plot_policy_logs.py`: Utility for plotting logs generated during policy execution or training.
-  - `policy_inference.py`: Script for running inference using a trained RL policy.
-  - `policy_runner.py`: Node/script to execute a policy in a ROS 2 environment.
+  - [`__init__.py`](franka_rl_bridge/__init__.py)
+  - [`imitation_learning/`](franka_rl_bridge/imitation_learning)
+    - [`__init__.py`](franka_rl_bridge/imitation_learning/__init__.py)
+    - [`bc_policy_runner.py`](franka_rl_bridge/imitation_learning/bc_policy_runner.py) – Behavior Cloning (BC) policy execution.
+    - `utils/`
+      - [`__init__.py`](franka_rl_bridge/imitation_learning/utils/__init__.py)
+      - `...` BC utilities (data loading, preprocessing, model helpers).
+  - [`reinforcement_learning/`](franka_rl_bridge/reinforcement_learning)
+    - [`__init__.py`](franka_rl_bridge/reinforcement_learning/__init__.py)
+    - `joint_state_listener.py` – Subscribes to robot joint states and publishes standardized RL observations.
+    - `policy_inference.py` – Loads a trained RL policy and runs inference.
+    - `policy_runner.py` – Executes a policy in closed-loop control.
+    - `policy_plotter.py` – Live plotting / monitoring (entry point).
+    - `run_bc_tests.py`, `interactive_bc_tester.py`, `test_bc_policy.py` – BC / RL diagnostic and evaluation tools.
+    - `verify_topics.py` – Validates required ROS 2 topics.
+    - `monitor_observations.py` – Streams and inspects observation vectors.
+    - `pose_sender.py` – Sends target poses for testing / teleoperation.
+    - `...` additional helpers and experiment scripts.
+  - [`plotting/`](franka_rl_bridge/plotting)
+    - [`plot_data_json.py`](franka_rl_bridge/plotting/plot_data_json.py)
+    - [`plot_inference_real.py`](franka_rl_bridge/plotting/plot_inference_real.py)
+    - [`plot_inference_sim.py`](franka_rl_bridge/plotting/plot_inference_sim.py)
+    - [`plot_success_rate_inference.py`](franka_rl_bridge/plotting/plot_success_rate_inference.py)
+    - [`policy_plotter.py`](franka_rl_bridge/plotting/policy_plotter.py) – Offline plotting / post‑run analysis.
+    - Logs (CSV): `observations_test.csv`, `policy_inference_17_06_real_robot.csv`, `policy_inference_17_06.csv`, `policy_inference_24_07.csv`
+    - Figures (SVG): `results_detailed_analysis.svg`, `results_stacked_bar_chart.svg`
+  - `models/`
+    - `imitation_learning/` – Stored BC checkpoints.
+    - `reinforcement_learning/` – RL checkpoints (`*.pt` such as `model_1999.pt`, `franka_lift.pt`, `franka_lift2.pt`, etc.).
+  - Project metadata & packaging:
+    - [`package.xml`](franka_rl_bridge/package.xml)
+    - [`setup.py`](franka_rl_bridge/setup.py)
+    - [`setup.cfg`](franka_rl_bridge/setup.cfg)
+    - [`requirements.txt`](franka_rl_bridge/requirements.txt)
 
 ## Installation
 

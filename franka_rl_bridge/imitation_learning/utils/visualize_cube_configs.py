@@ -135,20 +135,35 @@ def plot_cube_configurations(configurations, save_path=None):
     plt.subplots_adjust(top=0.88, hspace=0.5, wspace=0.3)
     
     if save_path:
-        # Get file extension to determine format
+        # Get file extension to determine primary format
         save_path = Path(save_path)
-        
-        # Save as vector format (SVG) if specified, otherwise PNG
-        if save_path.suffix.lower() == '.svg':
-            plt.savefig(save_path, format='svg', bbox_inches='tight', 
-                       facecolor='white', edgecolor='none')
-            print(f"✅ Vector graphic saved to {save_path}")
+        suffix = save_path.suffix.lower()
+
+        # Primary save
+        if suffix == '.svg':
+            plt.savefig(save_path, format='svg', bbox_inches='tight',
+                        facecolor='white', edgecolor='none')
+            print(f"✅ Vector graphic (SVG) saved to {save_path}")
+        elif suffix == '.pdf':
+            plt.savefig(save_path, format='pdf', bbox_inches='tight',
+                        facecolor='white', edgecolor='none')
+            print(f"✅ Vector graphic (PDF) saved to {save_path}")
         else:
-            # Default PNG with high DPI
-            plt.savefig(save_path, dpi=600, bbox_inches='tight', 
-                       facecolor='white', edgecolor='none')
-            print(f"✅ Plot saved to {save_path}")
-    
+            # Default raster (e.g., .png)
+            plt.savefig(save_path, dpi=600, bbox_inches='tight',
+                        facecolor='white', edgecolor='none')
+            print(f"✅ Raster image saved to {save_path}")
+
+        # Always also save a PDF (publication ready) unless the main file already is PDF
+        if suffix != '.pdf':
+            pdf_path = save_path.with_suffix('.pdf')
+            try:
+                plt.savefig(pdf_path, format='pdf', bbox_inches='tight',
+                            facecolor='white', edgecolor='none')
+                print(f"📄 Additional publication PDF saved to {pdf_path}")
+            except Exception as e:
+                print(f"⚠️ Could not save PDF version: {e}")
+
     plt.show()
 
 def print_configuration_summary(configurations):

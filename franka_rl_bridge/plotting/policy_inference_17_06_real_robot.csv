@@ -1,0 +1,17 @@
+Configuration,Successes,Attempts,SuccessRate (%)
+config_00_random,7,8,87.5
+config_01_random,5,8,62.5
+config_02_random,5,8,62.5
+config_03_random,6,8,75.0
+config_04_random,7,8,87.5
+config_05_random,5,8,62.5
+config_06_random,7,8,87.5
+config_07_random,5,8,62.5
+config_08_random,5,8,62.5
+config_09_random,6,8,75.0
+config_10_random,6,8,75.0
+config_11_random,5,8,62.5
+config_12_random,6,8,75.0
+config_13_random,6,8,75.0
+config_14_random,6,8,75.0
+config_15_random,5,8,62.5

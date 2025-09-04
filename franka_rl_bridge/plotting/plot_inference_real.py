@@ -20,8 +20,59 @@ class EEFTrajectoryPlotter:
         self.csv_file = csv_file
         self.data = None
         self.trial_id = trial_id
-        self.config_description = None  # Add this to match the pattern from plot_inference_sim.py
-        
+        self.config_description = None
+        # Thesis style constants
+        self._title_font_size = 14
+        self._axis_font_size = 12
+        self._legend_font_size = 12
+        self._font_family = "Arial"   # or "DejaVu Sans" to match Matplotlib default
+
+    # ---------------------- NEW: unified styling helper ----------------------
+    def _apply_thesis_style(self, fig, title=None, x_title=None, y_title=None, height=None):
+        """Apply consistent thesis styling to a 2D Plotly figure."""
+        layout_updates = {
+            "font": dict(family=self._font_family, size=self._axis_font_size),
+            "plot_bgcolor": "white",
+            "paper_bgcolor": "white",
+            "hovermode": "x unified",
+            "margin": dict(l=70, r=30, t=60, b=60),
+            "legend": dict(
+                bgcolor="rgba(255,255,255,0.85)",
+                bordercolor="rgba(0,0,0,0.15)",
+                borderwidth=1,
+                font=dict(size=self._legend_font_size)
+            ),
+        }
+        if title is not None:
+            layout_updates["title"] = dict(
+                text=title,
+                font=dict(size=self._title_font_size),
+                x=0.5,
+                xanchor="center"
+            )
+        if height is not None:
+            layout_updates["height"] = height
+
+        fig.update_layout(**layout_updates)
+
+        # Apply axis formatting (only affects 2D axes)
+        fig.update_xaxes(
+            title_text=x_title,
+            title_font=dict(size=self._axis_font_size),
+            showgrid=True,
+            gridcolor="rgba(0,0,0,0.3)",
+            zeroline=False
+        )
+        fig.update_yaxes(
+            title_text=y_title,
+            title_font=dict(size=self._axis_font_size),
+            showgrid=True,
+            gridcolor="rgba(0,0,0,0.3)",
+            zeroline=False
+        )
+        return fig
+    # -------------------------------------------------------------------------
+
     def find_latest_csv(self, data_dir=None):
         """Find the latest EEF dynamics CSV file"""
         if data_dir is None:
@@ -259,21 +310,23 @@ class EEFTrajectoryPlotter:
         
         # Update layout with adjusted margins to accommodate left-side colorbar
         fig.update_layout(
-            title='End-Effector 3D Trajectory with Coordinate Frame',
+            title=dict(text='End-Effector 3D Trajectory with Coordinate Frame',
+                       font=dict(size=self._title_font_size),
+                       x=0.5, xanchor='center'),
             scene=dict(
                 xaxis_title='X (m)',
                 yaxis_title='Y (m)',
                 zaxis_title='Z (m)',
-                aspectmode='data',
-                camera=dict(
-                    eye=dict(x=1.5, y=1.5, z=1.5)
-                )
+                xaxis=dict(backgroundcolor="white"),
+                yaxis=dict(backgroundcolor="white"),
+                zaxis=dict(backgroundcolor="white"),
             ),
-            height=1000,
+            font=dict(family=self._font_family, size=self._axis_font_size),
+            height=900,
             showlegend=True,
-            margin=dict(l=100, r=50, t=50, b=50)  # Increase left margin to make room for colorbar
+            margin=dict(l=100, r=50, t=60, b=50),
+            paper_bgcolor='white'
         )
-        
         return fig
     
     def create_position_time_plot(self):
@@ -301,13 +354,12 @@ class EEFTrajectoryPlotter:
                                  '<extra></extra>'
                 ))
     
-        fig.update_layout(
-            title='End-Effector Position vs Time',
-            xaxis_title='Time (s)',
-            yaxis_title='Position (m)',
-            height=400,
-            showlegend=True,
-            hovermode='x unified'
+        fig = self._apply_thesis_style(
+            fig,
+            title="End-Effector Position vs Time",
+            x_title="Time (s)",
+            y_title="Position (m)",
+            height=400
         )
     
         return fig
@@ -358,13 +410,12 @@ class EEFTrajectoryPlotter:
                              '<extra></extra>'
             ))
         
-        fig.update_layout(
-            title='End-Effector Quaternion Components vs Time',
-            xaxis_title='Time (s)',
-            yaxis_title='Quaternion Component',
-            height=400,
-            showlegend=True,
-            hovermode='x unified'
+        fig = self._apply_thesis_style(
+            fig,
+            title="End-Effector Quaternion Components vs Time",
+            x_title="Time (s)",
+            y_title="Quaternion Component",
+            height=400
         )
         
         return fig
@@ -423,13 +474,12 @@ class EEFTrajectoryPlotter:
                              '<extra></extra>'
             ))
         
-        fig.update_layout(
-            title='End-Effector Velocity vs Time',
-            xaxis_title='Time (s)',
-            yaxis_title='Velocity (m/s)',
-            height=400,
-            showlegend=True,
-            hovermode='x unified'
+        fig = self._apply_thesis_style(
+            fig,
+            title="End-Effector Velocity vs Time",
+            x_title="Time (s)",
+            y_title="Velocity (m/s)",
+            height=400
         )
         
         return fig
@@ -468,13 +518,12 @@ class EEFTrajectoryPlotter:
             annotation_position="top right"
         )
         
-        fig.update_layout(
-            title='Robot Manipulability Index vs Time',
-            xaxis_title='Time (s)',
-            yaxis_title='Manipulability Index',
-            height=400,
-            showlegend=True,
-            hovermode='x unified'
+        fig = self._apply_thesis_style(
+            fig,
+            title="Robot Manipulability Index vs Time",
+            x_title="Time (s)",
+            y_title="Manipulability Index",
+            height=400
         )
         
         return fig
@@ -529,15 +578,15 @@ class EEFTrajectoryPlotter:
             annotation_position="bottom left"  # Changed from "middle right" to "bottom left"
         )
         
-        fig.update_layout(
-            title='Gripper Command vs Time',
-            xaxis_title='Time (s)',
-            yaxis_title='Gripper Command',
-            height=400,
-            showlegend=True,
-            hovermode='x unified',
-            yaxis=dict(range=[-1.2, 1.2])  # Set y-axis range for better visibility
+        fig = self._apply_thesis_style(
+            fig,
+            title="Gripper Command vs Time",
+            x_title="Time (s)",
+            y_title="Gripper Command",
+            height=400
         )
+        # Preserve custom y-range
+        fig.update_yaxes(range=[-1.2, 1.2])
         
         return fig
     
@@ -732,23 +781,25 @@ class EEFTrajectoryPlotter:
             title_text += f" - {self.config_description}"
         
         fig.update_layout(
-            height=900,
-            title_text=title_text,
-            showlegend=True
+            font=dict(family=self._font_family, size=self._axis_font_size),
+            title=dict(text=title_text, font=dict(size=self._title_font_size), x=0.5, xanchor='center'),
+            plot_bgcolor='white',
+            paper_bgcolor='white',
+            legend=dict(
+                bgcolor="rgba(255,255,255,0.85)",
+                bordercolor="rgba(0,0,0,0.15)",
+                borderwidth=1,
+                font=dict(size=self._legend_font_size),
+            )
         )
         
-        # Update axis labels for 2D plots
-        fig.update_xaxes(title_text="Time (s)", row=1, col=1)  # Position plot
-        fig.update_yaxes(title_text="Position (m)", row=1, col=1)
-        
-        fig.update_xaxes(title_text="Time (s)", row=1, col=3)  # Gripper plot  
-        fig.update_yaxes(title_text="Gripper Command", row=1, col=3)
-        
-        fig.update_xaxes(title_text="Time (s)", row=2, col=1)  # Quaternion plot
-        fig.update_yaxes(title_text="Quaternion", row=2, col=1)
-        
-        fig.update_xaxes(title_text="Time (s)", row=2, col=2)  # Manipulability plot
-        fig.update_yaxes(title_text="Manipulability Index", row=2, col=2)
+        # Uniform axis styling for all 2D subplots
+        for r in [1, 2]:
+            for c in [1, 3] if r == 1 else [1, 2]:
+                fig.update_xaxes(showgrid=True, gridcolor="rgba(0,0,0,0.3)", zeroline=False, row=r, col=c,
+                                 title_font=dict(size=self._axis_font_size))
+                fig.update_yaxes(showgrid=True, gridcolor="rgba(0,0,0,0.3)", zeroline=False, row=r, col=c,
+                                 title_font=dict(size=self._axis_font_size))
         
         return fig
     
@@ -820,9 +871,9 @@ class EEFTrajectoryPlotter:
         
         print("="*70)
     
-    # Update the plot_all method to include gripper plot
+    # Update the plot_all method to include PDF export
     def plot_all(self, show_stats=True, save_html=None, show_plots=True):
-        """Plot all visualizations"""
+        """Plot all visualizations and optionally save HTML + PDF"""
         if not self.load_data():
             return False
         
@@ -831,82 +882,61 @@ class EEFTrajectoryPlotter:
         
         # Create individual plots
         print("\n📊 Creating plots...")
-        
-        # 1. 3D Trajectory Plot
-        print("  - 3D Trajectory")
         traj_fig = self.create_trajectory_plot()
-        
-        # 2. Position vs Time Plot
-        print("  - Position vs Time")
         pos_fig = self.create_position_time_plot()
-        
-        # 3. Quaternion vs Time Plot
-        print("  - Quaternion vs Time") 
         quat_fig = self.create_quaternion_plot()
-        
-        # 4. Gripper Command Plot (NEW)
-        print("  - Gripper Command")
         gripper_fig = self.create_gripper_plot()
-        
-        # 5. Manipulability Index Plot
-        print("  - Manipulability Index")
         manip_fig = self.create_manipulability_plot()
-        
-        # 6. Combined Dashboard
-        print("  - Combined Dashboard")
         dashboard_fig = self.create_combined_dashboard()
         
-        # Save HTML files if requested
+        # Save HTML (existing behavior) + new PDF export
         if save_html:
-            print(f"\n💾 Saving HTML files...")
+            print(f"\n💾 Saving HTML + PDF files...")
             base_name = save_html.replace('.html', '')
             
-            if traj_fig:
-                traj_fig.write_html(f"{base_name}_trajectory.html")
-                print(f"  - {base_name}_trajectory.html")
+            figures = [
+                ('trajectory', traj_fig),
+                ('position', pos_fig),
+                ('quaternion', quat_fig),
+                ('gripper', gripper_fig),
+                ('manipulability', manip_fig),
+                ('dashboard', dashboard_fig),
+            ]
             
-            if pos_fig:
-                pos_fig.write_html(f"{base_name}_position.html") 
-                print(f"  - {base_name}_position.html")
+            # Common image export config (fine for PDF vector output)
+            pdf_cfg = dict(width=1200, height=800, scale=2, format='pdf')
             
-            if quat_fig:
-                quat_fig.write_html(f"{base_name}_quaternion.html")
-                print(f"  - {base_name}_quaternion.html")
-            
-            if gripper_fig:
-                gripper_fig.write_html(f"{base_name}_gripper.html")
-                print(f"  - {base_name}_gripper.html")
-            
-            if manip_fig:
-                manip_fig.write_html(f"{base_name}_manipulability.html")
-                print(f"  - {base_name}_manipulability.html")
-            
-            if dashboard_fig:
-                dashboard_fig.write_html(f"{base_name}_dashboard.html")
-                print(f"  - {base_name}_dashboard.html")
-    
-        # Show plots
+            for suffix, fig in figures:
+                if fig:
+                    html_path = f"{base_name}_{suffix}.html"
+                    pdf_path = f"{base_name}_{suffix}.pdf"
+                    try:
+                        fig.write_html(html_path)
+                        print(f"  ✅ {html_path}")
+                    except Exception as e:
+                        print(f"  ⚠️ Failed HTML ({suffix}): {e}")
+                    try:
+                        fig.write_image(pdf_path, **pdf_cfg)
+                        print(f"    📄 PDF saved: {pdf_path}")
+                    except Exception as e:
+                        print(f"    ⚠️ Failed PDF ({suffix}): {e} (install with: pip install kaleido)")
+        
         if show_plots:
             print(f"\n🖥️ Displaying plots...")
-            
             if dashboard_fig:
                 print("  - Opening Combined Dashboard")
                 dashboard_fig.show()
-            
             if traj_fig:
                 print("  - Opening 3D Trajectory")
                 traj_fig.show()
-            
             if gripper_fig:
                 print("  - Opening Gripper Command")
                 gripper_fig.show()
-            
             if manip_fig:
                 print("  - Opening Manipulability Index")
                 manip_fig.show()
-
+        
         return True
-
 
 def main():
     parser = argparse.ArgumentParser(description="Plot End-Effector Trajectory and Quaternion Data")

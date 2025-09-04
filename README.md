@@ -15,7 +15,6 @@
     - [`__init__.py`](franka_rl_bridge/imitation_learning/__init__.py)
     - [`bc_policy_runner.py`](franka_rl_bridge/imitation_learning/bc_policy_runner.py) – Behavior Cloning (BC) policy execution node.
     - `utils/` (core mixins & helpers used by bc_policy_runner)
-      - [`__init__.py`](franka_rl_bridge/imitation_learning/utils/__init__.py)
       - `cube_manager.py` – Cube pose management, attachment/detachment logic.
       - `gripper_control.py` – Gripper action clients, open/close sequencing, cooldowns.
       - `observations.py` – Builds structured observation dict (EEF, cubes, gripper, indices).
@@ -112,7 +111,58 @@ ros2 launch cartesian_impedance_control cartesian_impedance_controller.launch.py
 # Switch on the Imitation Learning mode
 ros2 param set /cartesian_impedance_controller imitation_learning_mode true
 
-# Start the PolicyRunner node to deploy a trained policy, add --deterministic flag if needed
-python3 franka_rl_bridge/imitation_learning/bc_policy_runner.py --policy /path/to/policy_checkpoint.pth 
+# Start the PolicyRunner node to deploy a trained policy (add --deterministic if desired)
+python3 franka_rl_bridge/imitation_learning/bc_policy_runner.py --policy /path/to/policy_checkpoint.pth
 ```
+## Plotting & Analysis Scripts
+
+All scripts live in franka_rl_bridge/plotting.
+
+Success rate / aggregate metrics:
+```bash
+python3 franka_rl_bridge/plotting/plot_success_rate_inference.py --csv /path/to/policy_inference_log.csv --output results.svg
+```
+
+Real robot inference trajectories:
+```bash
+python3 franka_rl_bridge/plotting/plot_inference_real.py --csv franka_rl_bridge/plotting/policy_inference_17_06_real_robot.csv
+```
+
+Simulation inference trajectories:
+```bash
+python3 franka_rl_bridge/plotting/plot_inference_sim.py --csv franka_rl_bridge/plotting/policy_inference_17_06.csv
+```
+
+Generic observation / action plotter:
+```bash
+python3 franka_rl_bridge/plotting/policy_plotter.py --csv franka_rl_bridge/plotting/observations_test.csv
+```
+
+JSON log to figures:
+```bash
+python3 franka_rl_bridge/plotting/plot_data_json.py --input /path/to/log.json --output plot.svg
+```
+
+(Use --no-show for headless environments; export different formats by changing the output extension.)
+
+## Reinforcement Learning Runtime
+
+Stream joint states / base observations:
+```bash
+python3 franka_rl_bridge/reinforcement_learning/joint_state_listener.py
+```
+
+Single (or batched) policy inference:
+```bash
+python3 franka_rl_bridge/reinforcement_learning/policy_inference.py --model /path/to/model.pt --deterministic
+```
+
+Continuous closed‑loop execution:
+```bash
+python3 franka_rl_bridge/reinforcement_learning/policy_runner.py --model /path/to/model.pt --rate 20
+```
+
+(Adjust --rate Hz to match controller; add logging flags if implemented.)
+
+
 

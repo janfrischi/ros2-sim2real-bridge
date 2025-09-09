@@ -113,10 +113,12 @@ ros2 param set /cartesian_impedance_controller imitation_learning_mode true
 
 # Start the PolicyRunner node to deploy a trained policy (add --deterministic if desired)
 python3 franka_rl_bridge/imitation_learning/bc_policy_runner.py --policy /path/to/policy_checkpoint.pth
+
+# Once in the PolicyRunner node you can subscribe to states of Vision Pipeline using th 'v' key.
 ```
 ## Plotting & Analysis Scripts
 
-All scripts live in franka_rl_bridge/plotting.
+All scripts live in franka_rl_bridge/plotting directory
 
 Success rate / aggregate metrics:
 ```bash
